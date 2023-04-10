@@ -29,10 +29,10 @@ export async function handler(event: AWSLambda.CloudFormationCustomResourceEvent
   | undefined
 > {
   const region = event.ResourceProperties['region'];
-  const inputStandards: { name: string; enable: boolean; controlsToDisable: string[] | undefined }[] =
-    event.ResourceProperties['standards'];
+  const solutionId = process.env['SOLUTION_ID'];
+  const inputStandards = JSON.parse(JSON.stringify(event.ResourceProperties['standards']));
 
-  const securityHubClient = new AWS.SecurityHub({ region: region });
+  const securityHubClient = new AWS.SecurityHub({ region: region, customUserAgent: solutionId });
 
   // Get AWS defined security standards name and ARN
   const awsSecurityHubStandards: { [name: string]: string }[] = [];
@@ -57,8 +57,6 @@ export async function handler(event: AWSLambda.CloudFormationCustomResourceEvent
     inputStandards,
     awsSecurityHubStandards,
   );
-  console.log('standardsModificationList');
-  console.log(standardsModificationList);
 
   switch (event.RequestType) {
     case 'Create':
@@ -67,7 +65,7 @@ export async function handler(event: AWSLambda.CloudFormationCustomResourceEvent
 
       // When there are standards to be enable
       if (standardsModificationList.toEnableStandardRequests.length > 0) {
-        console.log('to enable');
+        console.log('To enable:');
         console.log(standardsModificationList.toEnableStandardRequests);
         await throttlingBackOff(() =>
           securityHubClient
@@ -80,8 +78,7 @@ export async function handler(event: AWSLambda.CloudFormationCustomResourceEvent
 
       // When there are standards to be disable
       if (standardsModificationList.toDisableStandardArns!.length > 0) {
-        console.log('to disable');
-        console.log(standardsModificationList.toEnableStandardRequests);
+        console.log(`Disabling standard ${standardsModificationList.toDisableStandardArns!}`);
         await throttlingBackOff(() =>
           securityHubClient
             .batchDisableStandards({
@@ -173,7 +170,6 @@ async function getExistingEnabledStandards(
   // Get list of  existing enabled standards within securityhub
   const existingEnabledStandardArns: AWS.SecurityHub.StandardsSubscription[] = [];
   response.StandardsSubscriptions!.forEach(item => {
-    // if (item.StandardsStatus === StandardsStatus.READY) {
     existingEnabledStandardArns.push({
       StandardsArn: item.StandardsArn!,
       StandardsInput: item.StandardsInput!,
@@ -194,17 +190,20 @@ async function getExistingEnabledStandards(
  */
 async function getControlArnsToModify(
   securityHubClient: AWS.SecurityHub,
-  inputStandards: { name: string; enable: boolean; controlsToDisable: string[] | undefined }[],
+  inputStandards: { name: string; enable: string; controlsToDisable: string[] | undefined }[],
   awsSecurityHubStandards: { [name: string]: string }[],
 ): Promise<{ disableStandardControlArns: string[]; enableStandardControlArns: string[] }> {
   const existingEnabledStandards = await getExistingEnabledStandards(securityHubClient);
   const disableStandardControls: string[] = [];
   const enableStandardControls: string[] = [];
 
+  let nextToken: string | undefined = undefined;
   for (const inputStandard of inputStandards) {
-    if (inputStandard.enable) {
+    console.log(`inputStandard: ${JSON.stringify(inputStandard)}`);
+    if (inputStandard.enable === 'true') {
       for (const awsSecurityHubStandard of awsSecurityHubStandards) {
         if (awsSecurityHubStandard[inputStandard.name]) {
+          console.log(`Standard Name: ${awsSecurityHubStandard[inputStandard.name]}`);
           const existingEnabledStandard = existingEnabledStandards.find(
             item => item.StandardsArn === awsSecurityHubStandard[inputStandard.name],
           );
@@ -213,15 +212,11 @@ async function getControlArnsToModify(
 
             const standardsControl: AWS.SecurityHub.StandardsControl[] = [];
 
-            let nextToken: string | undefined = undefined;
             do {
-              const page = await throttlingBackOff(() =>
-                securityHubClient
-                  .describeStandardsControls({
-                    StandardsSubscriptionArn: existingEnabledStandard?.StandardsSubscriptionArn,
-                    NextToken: nextToken,
-                  })
-                  .promise(),
+              const page: AWS.SecurityHub.DescribeStandardsControlsResponse = await getDescribeStandardsControls(
+                securityHubClient,
+                existingEnabledStandard?.StandardsSubscriptionArn,
+                nextToken,
               );
               for (const control of page.Controls ?? []) {
                 standardsControl.push(control);
@@ -235,15 +230,12 @@ async function getControlArnsToModify(
               );
               await delay(10000);
               console.warn(`Rechecking - Getting controls for ${existingEnabledStandard?.StandardsSubscriptionArn}`);
-              let nextToken: string | undefined = undefined;
+              nextToken = undefined;
               do {
-                const page = await throttlingBackOff(() =>
-                  securityHubClient
-                    .describeStandardsControls({
-                      StandardsSubscriptionArn: existingEnabledStandard?.StandardsSubscriptionArn,
-                      NextToken: nextToken,
-                    })
-                    .promise(),
+                const page: AWS.SecurityHub.DescribeStandardsControlsResponse = await getDescribeStandardsControls(
+                  securityHubClient,
+                  existingEnabledStandard?.StandardsSubscriptionArn,
+                  nextToken,
                 );
                 for (const control of page.Controls ?? []) {
                   standardsControl.push(control);
@@ -258,7 +250,6 @@ async function getControlArnsToModify(
             for (const control of standardsControl) {
               if (inputStandard.controlsToDisable?.includes(control.ControlId!)) {
                 console.log(control.ControlId!);
-                console.log(inputStandard.name);
                 disableStandardControls.push(control.StandardsControlArn!);
               } else {
                 if (control.ControlStatus == 'DISABLED') {
@@ -273,10 +264,6 @@ async function getControlArnsToModify(
       }
     }
   }
-  console.log('***********');
-  console.log(disableStandardControls);
-  console.log(enableStandardControls);
-  console.log('***********');
 
   return { disableStandardControlArns: disableStandardControls, enableStandardControlArns: enableStandardControls };
 }
@@ -289,7 +276,7 @@ async function getControlArnsToModify(
  */
 async function getStandardsModificationList(
   securityHubClient: AWS.SecurityHub,
-  inputStandards: { name: string; enable: boolean; controlsToDisable: string[] | undefined }[],
+  inputStandards: { name: string; enable: string; controlsToDisable: string[] | undefined }[],
   awsSecurityHubStandards: { [name: string]: string }[],
 ): Promise<{
   toEnableStandardRequests: AWS.SecurityHub.StandardsSubscriptionRequests;
@@ -299,8 +286,14 @@ async function getStandardsModificationList(
   const toEnableStandardRequests: AWS.SecurityHub.StandardsSubscriptionRequests = [];
   const toDisableStandardArns: string[] | undefined = [];
 
+  if (!inputStandards || inputStandards.length === 0) {
+    for (const existingEnabledStandard of existingEnabledStandards) {
+      toDisableStandardArns.push(existingEnabledStandard?.StandardsSubscriptionArn);
+    }
+  }
+
   for (const inputStandard of inputStandards) {
-    if (inputStandard.enable) {
+    if (inputStandard.enable === 'true') {
       for (const awsSecurityHubStandard of awsSecurityHubStandards) {
         if (awsSecurityHubStandard[inputStandard.name]) {
           const existingEnabledStandard = existingEnabledStandards.filter(
@@ -331,4 +324,19 @@ async function getStandardsModificationList(
 
 async function delay(ms: number) {
   return new Promise(resolve => setTimeout(resolve, ms));
+}
+
+async function getDescribeStandardsControls(
+  securityHubClient: AWS.SecurityHub,
+  standardsSubscriptionArn: string,
+  nextToken?: string,
+): Promise<AWS.SecurityHub.DescribeStandardsControlsResponse> {
+  return throttlingBackOff(() =>
+    securityHubClient
+      .describeStandardsControls({
+        StandardsSubscriptionArn: standardsSubscriptionArn,
+        NextToken: nextToken,
+      })
+      .promise(),
+  );
 }

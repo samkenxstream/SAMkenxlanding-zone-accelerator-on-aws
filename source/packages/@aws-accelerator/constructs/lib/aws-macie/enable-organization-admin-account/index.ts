@@ -11,7 +11,7 @@
  *  and limitations under the License.
  */
 
-import { throttlingBackOff } from '@aws-accelerator/utils';
+import { delay, throttlingBackOff } from '@aws-accelerator/utils';
 import * as AWS from 'aws-sdk';
 AWS.config.logger = console;
 
@@ -30,7 +30,9 @@ export async function handler(event: AWSLambda.CloudFormationCustomResourceEvent
 > {
   const adminAccountId = event.ResourceProperties['adminAccountId'];
   const region = event.ResourceProperties['region'];
-  const macie2Client = new AWS.Macie2({ region: region });
+  const solutionId = process.env['SOLUTION_ID'];
+
+  const macie2Client = new AWS.Macie2({ region: region, customUserAgent: solutionId });
 
   const macieDelegatedAccount = await getMacieDelegatedAccount(macie2Client, adminAccountId);
 
@@ -71,9 +73,19 @@ export async function handler(event: AWSLambda.CloudFormationCustomResourceEvent
         console.log(
           `Started enableOrganizationAdminAccount function in ${event.ResourceProperties['region']} region for account ${adminAccountId}`,
         );
-        await throttlingBackOff(() =>
-          macie2Client.enableOrganizationAdminAccount({ adminAccountId: adminAccountId }).promise(),
-        );
+        let retries = 0;
+        while (retries < 10) {
+          await delay(retries ** 2 * 1000);
+          try {
+            await throttlingBackOff(() =>
+              macie2Client.enableOrganizationAdminAccount({ adminAccountId: adminAccountId }).promise(),
+            );
+            break;
+          } catch (error) {
+            console.log(error);
+            retries = retries + 1;
+          }
+        }
       }
 
       return { Status: 'Success', StatusCode: 200 };
@@ -139,7 +151,7 @@ async function isMacieEnable(macie2Client: AWS.Macie2): Promise<boolean> {
       return false;
     }
 
-    // This is required when macie is not enabled(first time executing in any management account) AccessDeniedException exception issues
+    // This is required when macie is not enabled AccessDeniedException exception issues
     if (
       // SDKv2 Error Structure
       e.code === 'AccessDeniedException' ||

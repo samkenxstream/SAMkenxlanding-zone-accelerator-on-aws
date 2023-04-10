@@ -21,18 +21,19 @@ import * as AWS from 'aws-sdk';
 import { throttlingBackOff } from '@aws-accelerator/utils';
 import { v4 as uuidv4 } from 'uuid';
 
-const documentClient = new AWS.DynamoDB.DocumentClient();
-const serviceCatalogClient = new AWS.ServiceCatalog();
-
 const tableName = process.env['NewAccountsTableName'] ?? '';
+const solutionId = process.env['SOLUTION_ID'] ?? '';
+
+const documentClient = new AWS.DynamoDB.DocumentClient({ customUserAgent: solutionId });
+const serviceCatalogClient = new AWS.ServiceCatalog({ customUserAgent: solutionId });
 
 interface AccountConfig {
   name: string;
   description: string;
   email: string;
-  enableGovCloud?: boolean | undefined;
-  organizationalUnitId: string | undefined;
-  createRequestId?: string | undefined;
+  enableGovCloud?: boolean;
+  organizationalUnitId?: string;
+  createRequestId?: string;
 }
 
 type AccountConfigs = Array<AccountConfig>;
@@ -48,7 +49,8 @@ export async function handler(event: any): Promise<
   // if provisioning is in progress return
   // we cannot provision another account while
   // an account is being provisioned
-  if ((await inProgress()) === true) {
+  const accountsInProcess = await inProgress();
+  if (accountsInProcess === 5) {
     console.log('Account provisioning in progress continuing to wait');
     return {
       IsComplete: false,
@@ -59,7 +61,7 @@ export async function handler(event: any): Promise<
     //get a single accountConfig from table and attempt to provision
     //if no record is returned then all new accounts are provisioned
     const accountToAdd: AccountConfigs = await getSingleAccountConfigFromTable();
-    if (accountToAdd.length === 0) {
+    if (accountToAdd.length === 0 && accountsInProcess === 0) {
       //check if any accounts in error or tainted state
       if (await provisionSuccess()) {
         console.log('Control Tower account provisioning complete.');
@@ -73,11 +75,13 @@ export async function handler(event: any): Promise<
       };
     }
 
-    const provisionResponse = await provisionAccount(accountToAdd[0]);
-    console.log(`Provision response: ${JSON.stringify(provisionResponse)}`);
+    if (accountToAdd.length > 0) {
+      const provisionResponse = await provisionAccount(accountToAdd[0]);
+      console.log(`Provision response: ${JSON.stringify(provisionResponse)}`);
 
-    const deleteResponse = await deleteSingleAccountConfigFromTable(accountToAdd[0].email);
-    console.log(`Delete response: ${JSON.stringify(deleteResponse)}`);
+      const deleteResponse = await deleteSingleAccountConfigFromTable(accountToAdd[0].email);
+      console.log(`Delete response: ${JSON.stringify(deleteResponse)}`);
+    }
 
     return {
       IsComplete: false,
@@ -90,22 +94,24 @@ export async function handler(event: any): Promise<
   }
 }
 
-async function inProgress(): Promise<boolean> {
+async function inProgress(): Promise<number> {
   const provisionedProductsUnderChange: AWS.ServiceCatalog.ProvisionedProductAttribute[] =
     await getProvisionedProductsWithStatus('UNDER_CHANGE');
+  let accountsInProcess = 0;
   if (provisionedProductsUnderChange.length > 0) {
-    console.log('Products are UNDER_CHANGE');
-    return true;
+    console.log(`Products that are UNDER_CHANGE ${provisionedProductsUnderChange.length}`);
+    accountsInProcess = accountsInProcess + provisionedProductsUnderChange.length;
   }
 
   const provisionedProductsPlan: AWS.ServiceCatalog.ProvisionedProductAttribute[] =
     await getProvisionedProductsWithStatus('PLAN_IN_PROGRESS');
   if (provisionedProductsPlan.length > 0) {
-    console.log('Products are PLAN_IN_PROGRESS');
-    return true;
+    console.log(`Products that are PLAN_IN_PROGRESS ${provisionedProductsPlan.length}`);
+    accountsInProcess = accountsInProcess + provisionedProductsPlan.length;
   }
 
-  return false;
+  console.log(`Total number of accounts in process ${accountsInProcess}`);
+  return accountsInProcess;
 }
 
 async function provisionSuccess(): Promise<boolean> {
@@ -166,7 +172,8 @@ async function getSingleAccountConfigFromTable(): Promise<AccountConfigs> {
   const response = await throttlingBackOff(() => documentClient.scan(scanParams).promise());
 
   console.log(`getSingleAccount response ${JSON.stringify(response)}`);
-  if (response.Items?.length ?? 0 > 0) {
+  const itemCount = response.Items?.length ?? 0;
+  if (itemCount > 0) {
     const account: AccountConfig = JSON.parse(response.Items![0]['accountConfig']);
     accountToAdd.push(account);
     console.log(`Account to add ${JSON.stringify(accountToAdd)}`);
@@ -255,28 +262,25 @@ async function provisionAccount(accountToAdd: AccountConfig): Promise<AWS.Servic
     ],
   };
 
-  const response: AWS.ServiceCatalog.ProvisionProductOutput = await throttlingBackOff(() =>
-    serviceCatalogClient.provisionProduct(provisionInput).promise(),
-  );
-  return response;
+  return throttlingBackOff(() => serviceCatalogClient.provisionProduct(provisionInput).promise());
 }
 
-async function deleteAllRecordsFromTable(tableName: string) {
+async function deleteAllRecordsFromTable(paramTableName: string) {
   const params = {
-    TableName: tableName,
+    TableName: paramTableName,
     ProjectionExpression: 'accountEmail',
   };
   const response = await documentClient.scan(params).promise();
   if (response.Items) {
     for (const item of response.Items) {
       console.log(item['accountEmail']);
-      const params = {
-        TableName: tableName,
+      const itemParams = {
+        TableName: paramTableName,
         Key: {
           accountEmail: item['accountEmail'],
         },
       };
-      await documentClient.delete(params).promise();
+      await documentClient.delete(itemParams).promise();
     }
   }
 }

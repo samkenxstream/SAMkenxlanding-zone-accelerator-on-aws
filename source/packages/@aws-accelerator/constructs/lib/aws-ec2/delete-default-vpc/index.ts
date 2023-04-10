@@ -31,7 +31,8 @@ export async function handler(event: AWSLambda.CloudFormationCustomResourceEvent
 > {
   // Retrieve operating region that stack is ran
   const region = event.ResourceProperties['region'];
-  const ec2Client = new AWS.EC2({ region: region });
+  const solutionId = process.env['SOLUTION_ID'];
+  const ec2Client = new AWS.EC2({ region: region, customUserAgent: solutionId });
   const defaultVpcIds: string[] = [];
 
   switch (event.RequestType) {
@@ -40,13 +41,13 @@ export async function handler(event: AWSLambda.CloudFormationCustomResourceEvent
       console.log(`Starting - Deletion of default VPC and associated resources in ${region}`);
 
       // Retrieve default VPC(s)
-      let nextToken: string | undefined = undefined;
+      let describeVpcsNextToken: string | undefined = undefined;
       do {
         const page = await throttlingBackOff(() =>
           ec2Client
             .describeVpcs({
               Filters: [{ Name: 'is-default', Values: [`true`] }],
-              NextToken: nextToken,
+              NextToken: describeVpcsNextToken,
             })
             .promise(),
         );
@@ -56,8 +57,8 @@ export async function handler(event: AWSLambda.CloudFormationCustomResourceEvent
             defaultVpcIds.push(vpc.VpcId);
           }
         }
-        nextToken = page.NextToken;
-      } while (nextToken);
+        describeVpcsNextToken = page.NextToken;
+      } while (describeVpcsNextToken);
 
       console.log(`List of VPCs: `, defaultVpcIds);
       if (defaultVpcIds.length == 0) {

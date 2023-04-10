@@ -11,8 +11,9 @@
  *  and limitations under the License.
  */
 
-import { throttlingBackOff } from '@aws-accelerator/utils';
 import * as AWS from 'aws-sdk';
+
+import { throttlingBackOff } from '@aws-accelerator/utils';
 
 AWS.config.logger = console;
 
@@ -36,7 +37,7 @@ export async function handler(event: AWSLambda.CloudFormationCustomResourceEvent
     }
   | undefined
 > {
-  const ramClient = new AWS.RAM({});
+  const ramClient = new AWS.RAM({ customUserAgent: process.env['SOLUTION_ID'] });
 
   switch (event.RequestType) {
     case 'Create':

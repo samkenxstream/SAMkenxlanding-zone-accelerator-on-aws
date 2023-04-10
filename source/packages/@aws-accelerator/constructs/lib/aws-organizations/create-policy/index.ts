@@ -11,8 +11,10 @@
  *  and limitations under the License.
  */
 
-import { throttlingBackOff } from '@aws-accelerator/utils';
 import * as AWS from 'aws-sdk';
+
+import { throttlingBackOff } from '@aws-accelerator/utils';
+
 AWS.config.logger = console;
 
 /**
@@ -35,16 +37,17 @@ export async function handler(event: AWSLambda.CloudFormationCustomResourceEvent
   const type: string = event.ResourceProperties['type'];
   const tags: AWS.Organizations.Tag[] = event.ResourceProperties['tags'] || [];
   const partition: string = event.ResourceProperties['partition'];
-  const acceleratorPrefix: string = event.ResourceProperties['acceleratorPrefix'];
-  const managementAccountAccessRole: string = event.ResourceProperties['managementAccountAccessRole'];
+  const solutionId = process.env['SOLUTION_ID'];
 
   let organizationsClient: AWS.Organizations;
   if (partition === 'aws-us-gov') {
-    organizationsClient = new AWS.Organizations({ region: 'us-gov-west-1' });
+    organizationsClient = new AWS.Organizations({ region: 'us-gov-west-1', customUserAgent: solutionId });
+  } else if (partition === 'aws-cn') {
+    organizationsClient = new AWS.Organizations({ region: 'cn-northwest-1', customUserAgent: solutionId });
   } else {
-    organizationsClient = new AWS.Organizations({ region: 'us-east-1' });
+    organizationsClient = new AWS.Organizations({ region: 'us-east-1', customUserAgent: solutionId });
   }
-  const s3Client = new AWS.S3({});
+  const s3Client = new AWS.S3({ customUserAgent: solutionId });
 
   switch (event.RequestType) {
     case 'Create':
@@ -56,15 +59,6 @@ export async function handler(event: AWSLambda.CloudFormationCustomResourceEvent
       const content = s3Object.Body!.toString();
       console.log(content);
 
-      // Minify and update placeholder values
-      let policyContent: string = JSON.stringify(JSON.parse(content));
-      policyContent = replaceDefaults({
-        content: policyContent,
-        acceleratorPrefix: acceleratorPrefix,
-        managementAccountAccessRole: managementAccountAccessRole,
-        partition: partition,
-        additionalReplacements: {},
-      });
       //
       // Check if already exists, update and return the ID
       //
@@ -84,16 +78,16 @@ export async function handler(event: AWSLambda.CloudFormationCustomResourceEvent
               };
             }
 
-            const response = await throttlingBackOff(() =>
+            const updatePolicyResponse = await throttlingBackOff(() =>
               organizationsClient
-                .updatePolicy({ Name: name, Content: policyContent, Description: description, PolicyId: policy.Id! })
+                .updatePolicy({ Name: name, Content: content, Description: description, PolicyId: policy.Id! })
                 .promise(),
             );
 
-            console.log(response.Policy?.PolicySummary?.Id);
+            console.log(updatePolicyResponse.Policy?.PolicySummary?.Id);
 
             return {
-              PhysicalResourceId: response.Policy?.PolicySummary?.Id,
+              PhysicalResourceId: updatePolicyResponse.Policy?.PolicySummary?.Id,
               Status: 'SUCCESS',
             };
           }
@@ -104,16 +98,16 @@ export async function handler(event: AWSLambda.CloudFormationCustomResourceEvent
       //
       // Create if not found
       //
-      const response = await throttlingBackOff(() =>
+      const createPolicyResponse = await throttlingBackOff(() =>
         organizationsClient
-          .createPolicy({ Content: policyContent, Description: description, Name: name, Tags: tags, Type: type })
+          .createPolicy({ Content: content, Description: description, Name: name, Tags: tags, Type: type })
           .promise(),
       );
 
-      console.log(response.Policy?.PolicySummary?.Id);
+      console.log(createPolicyResponse.Policy?.PolicySummary?.Id);
 
       return {
-        PhysicalResourceId: response.Policy?.PolicySummary?.Id,
+        PhysicalResourceId: createPolicyResponse.Policy?.PolicySummary?.Id,
         Status: 'SUCCESS',
       };
 
@@ -124,33 +118,4 @@ export async function handler(event: AWSLambda.CloudFormationCustomResourceEvent
         Status: 'SUCCESS',
       };
   }
-}
-
-function replaceDefaults(props: {
-  content: string;
-  acceleratorPrefix: string;
-  managementAccountAccessRole: string;
-  partition: string;
-  additionalReplacements: { [key: string]: string | string[] };
-}): string {
-  const { acceleratorPrefix, additionalReplacements, managementAccountAccessRole, partition } = props;
-  let { content } = props;
-
-  for (const [key, value] of Object.entries(additionalReplacements)) {
-    console.log(`key: ${key}, value: ${value}`);
-    content = content.replace(new RegExp(key, 'g'), StringType.is(value) ? value : JSON.stringify(value));
-  }
-
-  const replacements = {
-    '\\${MANAGEMENT_ACCOUNT_ACCESS_ROLE}': managementAccountAccessRole,
-    '\\${ACCELERATOR_PREFIX}': acceleratorPrefix,
-    '\\${PARTITION}': partition,
-  };
-
-  Object.entries(replacements).map(([key, value]) => {
-    content = content.replace(new RegExp(key, 'g'), value);
-  });
-  console.log(`Policy with placeholder values ${content}`);
-
-  return content;
 }

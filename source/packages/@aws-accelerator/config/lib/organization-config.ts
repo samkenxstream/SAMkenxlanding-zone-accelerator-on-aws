@@ -11,12 +11,16 @@
  *  and limitations under the License.
  */
 
-import { throttlingBackOff } from '@aws-accelerator/utils';
 import * as AWS from 'aws-sdk';
 import * as fs from 'fs';
 import * as yaml from 'js-yaml';
 import * as path from 'path';
+
+import { createLogger, throttlingBackOff } from '@aws-accelerator/utils';
+
 import * as t from './common-types';
+
+const logger = createLogger(['organization-config']);
 
 /**
  * AWS Organizations configuration items.
@@ -24,6 +28,7 @@ import * as t from './common-types';
 export abstract class OrganizationConfigTypes {
   static readonly organizationalUnitConfig = t.interface({
     name: t.nonEmptyString,
+    ignore: t.optional(t.boolean),
   });
 
   static readonly organizationalUnitIdConfig = t.interface({
@@ -70,7 +75,17 @@ export abstract class OrganizationConfigTypes {
 }
 
 /**
+ * *{@link OrganizationConfig} / {@link OrganizationalUnitConfig}*
+ *
  * AWS Organizational Unit (OU) configuration
+ *
+ * @example
+ * ```
+ * organizationalUnits:
+ *   - name: Sandbox
+ *   - name: Suspended
+ *     ignore: true
+ * ```
  */
 export abstract class OrganizationalUnitConfig
   implements t.TypeOf<typeof OrganizationConfigTypes.organizationalUnitConfig>
@@ -88,10 +103,26 @@ export abstract class OrganizationalUnitConfig
    * - name: Sandbox/Development/Application1
    */
   readonly name: string = '';
+  /**
+   * Optional property used to ignore organizational unit and
+   * the associated accounts
+   * Default value is false
+   */
+  readonly ignore: boolean | undefined = undefined;
 }
 
 /**
- * Organizational unit in configuration
+ * *{@link OrganizationConfig} / {@link OrganizationalUnitIdConfig}
+ *
+ * Organizational unit id configuration
+ *
+ * @example
+ * ```
+ * organizationalUnitIds:
+ *   - name: Sandbox
+ *     id: o-abc123
+ *     arn: <ARN_of_OU>
+ * ```
  */
 export abstract class OrganizationalUnitIdConfig
   implements t.TypeOf<typeof OrganizationConfigTypes.organizationalUnitIdConfig>
@@ -111,7 +142,16 @@ export abstract class OrganizationalUnitIdConfig
 }
 
 /**
+ * *{@link OrganizationConfig} / {@link QuarantineNewAccountsConfig}*
+ *
  * Quarantine SCP application configuration
+ *
+ * @example
+ * ```
+ * quarantineNewAccounts:
+ *   enable: true
+ *   scpPolicyName: QuarantineAccounts
+ * ```
  */
 export abstract class QuarantineNewAccountsConfig
   implements t.TypeOf<typeof OrganizationConfigTypes.quarantineNewAccountsConfig>
@@ -131,7 +171,19 @@ export abstract class QuarantineNewAccountsConfig
 }
 
 /**
+ * *{@link OrganizationConfig} / {@link ServiceControlPolicyConfig}*
+ *
  * Service control policy configuration
+ *
+ * @example
+ * ```
+ * serviceControlPolicies:
+ *   - name: QuarantineAccounts
+ *     policy: path/to/policy.json
+ *     type: customerManaged
+ *     deploymentTargets:
+ *       organizationalUnits: []
+ * ```
  */
 export abstract class ServiceControlPolicyConfig
   implements t.TypeOf<typeof OrganizationConfigTypes.serviceControlPolicyConfig>
@@ -160,10 +212,23 @@ export abstract class ServiceControlPolicyConfig
 }
 
 /**
+ * *{@link OrganizationConfig} / {@link TaggingPolicyConfig}*
+ *
  * Organizations tag policy.
  *
  * Tag policies help you standardize tags on all tagged resources across your organization.
  * You can use tag policies to define tag keys (including how they should be capitalized) and their allowed values.
+ *
+ * @example
+ * ```
+ * taggingPolicies:
+ *   - name: TagPolicy
+ *     description: Organization Tagging Policy
+ *     policy: tagging-policies/org-tag-policy.json
+ *     deploymentTargets:
+ *         organizationalUnits:
+ *           - Root
+ * ```
  */
 export abstract class TaggingPolicyConfig implements t.TypeOf<typeof OrganizationConfigTypes.tagPolicyConfig> {
   /**
@@ -186,10 +251,23 @@ export abstract class TaggingPolicyConfig implements t.TypeOf<typeof Organizatio
 }
 
 /**
+ * *{@link OrganizationConfig} / {@link BackupPolicyConfig}*
+ *
  * Organization backup policy
  *
  * Backup policies enable you to deploy organization-wide backup plans to help ensure compliance across your organization's accounts.
  * Using policies helps ensure consistency in how you implement your backup plans
+ *
+ * @example
+ * ```
+ * backupPolicies:
+ *   - name: BackupPolicy
+ *     description: Organization Backup Policy
+ *     policy: backup-policies/org-backup-policies.json
+ *     deploymentTargets:
+ *         organizationalUnits:
+ *           - Root
+ * ```
  */
 export abstract class BackupPolicyConfig implements t.TypeOf<typeof OrganizationConfigTypes.backupPolicyConfig> {
   /**
@@ -247,9 +325,11 @@ export class OrganizationConfig implements t.TypeOf<typeof OrganizationConfigTyp
   readonly organizationalUnits: OrganizationalUnitConfig[] = [
     {
       name: 'Security',
+      ignore: undefined,
     },
     {
       name: 'Infrastructure',
+      ignore: undefined,
     },
   ];
 
@@ -334,54 +414,139 @@ export class OrganizationConfig implements t.TypeOf<typeof OrganizationConfigTyp
    *
    * @param values
    * @param configDir
+   * @param validateConfig
    */
-  constructor(values?: t.TypeOf<typeof OrganizationConfigTypes.organizationConfig>, configDir?: string) {
-    //
-    // Validation errors
-    //
+  constructor(
+    values?: t.TypeOf<typeof OrganizationConfigTypes.organizationConfig>,
+    configDir?: string,
+    validateConfig?: boolean,
+  ) {
     const errors: string[] = [];
+
     if (values) {
-      if (configDir) {
-        for (const serviceControlPolicy of values.serviceControlPolicies ?? []) {
-          // Validate presence of service control policy file
-          if (!fs.existsSync(path.join(configDir, serviceControlPolicy.policy))) {
-            errors.push(
-              `Invalid policy file ${serviceControlPolicy.policy} for service control policy ${serviceControlPolicy.name} !!!`,
-            );
-          }
-        }
+      if (configDir && validateConfig) {
+        // Validate presence of service control policy file
+        this.validateServiceControlPolicyFile(configDir, values, errors);
 
         // Validate presence of tagging policy file
-        for (const taggingPolicy of values.taggingPolicies ?? []) {
-          if (!fs.existsSync(path.join(configDir, taggingPolicy.policy))) {
-            errors.push(`Invalid policy file ${taggingPolicy.policy} for tagging policy ${taggingPolicy.name} !!!`);
-          }
-        }
+        this.validateTaggingPolicyFile(configDir, values, errors);
 
         // Validate presence of backup policy file
-        for (const backupPolicy of values.backupPolicies ?? []) {
-          if (!fs.existsSync(path.join(configDir, backupPolicy.policy))) {
-            errors.push(`Invalid policy file ${backupPolicy.policy} for backup policy ${backupPolicy.name} !!!`);
-          }
-        }
+        this.validateBackupPolicyFile(configDir, values, errors);
       }
 
       if (errors.length) {
-        throw new Error(`${OrganizationConfig.FILENAME} has ${errors.length} issues: ${errors.join(' ')}`);
+        logger.error(`${OrganizationConfig.FILENAME} has ${errors.length} issues: ${errors.join(' ')}`);
+        throw new Error('configuration validation failed');
       }
       Object.assign(this, values);
     }
   }
 
   /**
+   * Function to validate service control policy file existence
+   * @param configDir
+   * @param values
+   */
+  private validateServiceControlPolicyFile(
+    configDir: string,
+    values: t.TypeOf<typeof OrganizationConfigTypes.organizationConfig>,
+    errors: string[],
+  ) {
+    type validateScpItem = {
+      orgEntity: string;
+      orgEntityType: string;
+      appliedScpName: string[];
+    };
+    const validateScpCountForOrg: validateScpItem[] = [];
+    for (const serviceControlPolicy of values.serviceControlPolicies ?? []) {
+      if (!fs.existsSync(path.join(configDir, serviceControlPolicy.policy))) {
+        errors.push(
+          `Invalid policy file ${serviceControlPolicy.policy} for service control policy ${serviceControlPolicy.name} !!!`,
+        );
+      }
+
+      for (const orgUnitScp of serviceControlPolicy.deploymentTargets.organizationalUnits ?? []) {
+        //check in array to see if OU is already there
+        const index = validateScpCountForOrg.map(object => object.orgEntity).indexOf(orgUnitScp);
+        if (index > -1) {
+          validateScpCountForOrg[index].appliedScpName.push(serviceControlPolicy.name);
+        } else {
+          validateScpCountForOrg.push({
+            orgEntity: orgUnitScp,
+            orgEntityType: 'Organization Unit',
+            appliedScpName: [serviceControlPolicy.name],
+          });
+        }
+      }
+      for (const accUnitScp of serviceControlPolicy.deploymentTargets.accounts ?? []) {
+        //check in array to see if account is already there
+        const index = validateScpCountForOrg.map(object => object.orgEntity).indexOf(accUnitScp);
+        if (index > -1) {
+          validateScpCountForOrg[index].appliedScpName.push(serviceControlPolicy.name);
+        } else {
+          validateScpCountForOrg.push({
+            orgEntity: accUnitScp,
+            orgEntityType: 'Account',
+            appliedScpName: [serviceControlPolicy.name],
+          });
+        }
+      }
+    }
+    for (const validateOrgEntity of validateScpCountForOrg) {
+      if (validateOrgEntity.appliedScpName.length > 5) {
+        errors.push(
+          `${validateOrgEntity.orgEntityType} - ${validateOrgEntity.orgEntity} has ${validateOrgEntity.appliedScpName.length} out of 5 allowed scps`,
+        );
+      }
+    }
+  }
+
+  /**
+   * Function to validate tagging policy file existence
+   * @param configDir
+   * @param values
+   */
+  private validateTaggingPolicyFile(
+    configDir: string,
+    values: t.TypeOf<typeof OrganizationConfigTypes.organizationConfig>,
+    errors: string[],
+  ) {
+    for (const taggingPolicy of values.taggingPolicies ?? []) {
+      if (!fs.existsSync(path.join(configDir, taggingPolicy.policy))) {
+        errors.push(`Invalid policy file ${taggingPolicy.policy} for tagging policy ${taggingPolicy.name} !!!`);
+      }
+    }
+  }
+
+  /**
+   * Function to validate presence of backup policy file existence
+   * @param configDir
+   * @param values
+   */
+  private validateBackupPolicyFile(
+    configDir: string,
+    values: t.TypeOf<typeof OrganizationConfigTypes.organizationConfig>,
+    errors: string[],
+  ) {
+    // Validate presence of backup policy file
+    for (const backupPolicy of values.backupPolicies ?? []) {
+      if (!fs.existsSync(path.join(configDir, backupPolicy.policy))) {
+        errors.push(`Invalid policy file ${backupPolicy.policy} for backup policy ${backupPolicy.name} !!!`);
+      }
+    }
+  }
+
+  /**
    * Load from config file content
    * @param dir
+   * @param validateConfig
    * @returns
    */
-  static load(dir: string): OrganizationConfig {
+  static load(dir: string, validateConfig?: boolean): OrganizationConfig {
     const buffer = fs.readFileSync(path.join(dir, OrganizationConfig.FILENAME), 'utf8');
     const values = t.parse(OrganizationConfigTypes.organizationConfig, yaml.load(buffer));
-    return new OrganizationConfig(values, dir);
+    return new OrganizationConfig(values, dir, validateConfig);
   }
 
   /**
@@ -398,23 +563,27 @@ export class OrganizationConfig implements t.TypeOf<typeof OrganizationConfigTyp
       let organizationsClient: AWS.Organizations;
       if (partition === 'aws-us-gov') {
         organizationsClient = new AWS.Organizations({ region: 'us-gov-west-1' });
+      } else if (partition === 'aws-cn') {
+        organizationsClient = new AWS.Organizations({ region: 'cn-northwest-1' });
       } else {
         organizationsClient = new AWS.Organizations({ region: 'us-east-1' });
       }
 
       let rootId = '';
 
-      let nextToken: string | undefined = undefined;
+      let listRootsNextToken: string | undefined = undefined;
       do {
-        const page = await throttlingBackOff(() => organizationsClient.listRoots({ NextToken: nextToken }).promise());
+        const page = await throttlingBackOff(() =>
+          organizationsClient.listRoots({ NextToken: listRootsNextToken }).promise(),
+        );
         for (const root of page.Roots ?? []) {
           if (root.Name === 'Root' && root.Id && root.Arn) {
             this.organizationalUnitIds?.push({ name: root.Name, id: root.Id, arn: root.Arn });
             rootId = root.Id;
           }
         }
-        nextToken = page.NextToken;
-      } while (nextToken);
+        listRootsNextToken = page.NextToken;
+      } while (listRootsNextToken);
 
       for (const item of this.organizationalUnits) {
         let parentId = rootId;
@@ -423,11 +592,11 @@ export class OrganizationConfig implements t.TypeOf<typeof OrganizationConfigTyp
         const parentPath = this.getPath(item.name);
         for (const parent of parentPath.split('/')) {
           if (parent) {
-            let nextToken: string | undefined = undefined;
+            let ouForParentNextToken: string | undefined = undefined;
             do {
               const page = await throttlingBackOff(() =>
                 organizationsClient
-                  .listOrganizationalUnitsForParent({ ParentId: parentId, NextToken: nextToken })
+                  .listOrganizationalUnitsForParent({ ParentId: parentId, NextToken: ouForParentNextToken })
                   .promise(),
               );
               for (const ou of page.OrganizationalUnits ?? []) {
@@ -436,8 +605,8 @@ export class OrganizationConfig implements t.TypeOf<typeof OrganizationConfigTyp
                   parentName = ou.Name;
                 }
               }
-              nextToken = page.NextToken;
-            } while (nextToken);
+              ouForParentNextToken = page.NextToken;
+            } while (ouForParentNextToken);
           }
         }
 
@@ -470,7 +639,8 @@ export class OrganizationConfig implements t.TypeOf<typeof OrganizationConfigTyp
         return ou.id;
       }
     }
-    throw new Error("Organizations not enabled or OU doesn't exist");
+    logger.error("Organizations not enabled or OU doesn't exist");
+    throw new Error('configuration validation failed.');
   }
 
   public getOrganizationalUnitArn(name: string): string {
@@ -482,17 +652,26 @@ export class OrganizationConfig implements t.TypeOf<typeof OrganizationConfigTyp
         return ou.arn;
       }
     }
-    throw new Error("Organizations not enabled or OU doesn't exist");
+    logger.error("Organizations not enabled or OU doesn't exist");
+    throw new Error('configuration validation failed.');
+  }
+
+  public isIgnored(name: string): boolean {
+    const ou = this.organizationalUnits?.find(item => item.name === name);
+    if (ou?.ignore) {
+      return true;
+    }
+    return false;
   }
 
   public getPath(name: string): string {
     //get the parent path
     const pathIndex = name.lastIndexOf('/');
-    const path = name.slice(0, pathIndex + 1).slice(0, -1);
-    if (path === '') {
+    const ouPath = name.slice(0, pathIndex + 1).slice(0, -1);
+    if (ouPath === '') {
       return '/';
     }
-    return '/' + path;
+    return '/' + ouPath;
   }
 
   public getOuName(name: string): string {
@@ -504,8 +683,8 @@ export class OrganizationConfig implements t.TypeOf<typeof OrganizationConfigTyp
   }
 
   public getParentOuName(name: string): string {
-    const path = this.getPath(name);
-    const result = path.split('/').pop();
+    const parentOuPath = this.getPath(name);
+    const result = parentOuPath.split('/').pop();
     if (result === undefined) {
       return '/';
     }

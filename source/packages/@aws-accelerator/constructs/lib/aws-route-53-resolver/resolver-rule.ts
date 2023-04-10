@@ -47,7 +47,7 @@ export interface ResolverRuleProps {
   /**
    * The ID of the endpoint that the rule is associated with.
    */
-  readonly resolverEndpointId: string;
+  readonly resolverEndpointId?: string;
 
   /**
    * The type of resolver rule: FORWARD, RECURSIVE, or SYSTEM.
@@ -74,11 +74,11 @@ export interface ResolverRuleProps {
   /**
    * Custom resource lambda log group encryption key
    */
-  readonly kmsKey: cdk.aws_kms.Key;
+  readonly kmsKey?: cdk.aws_kms.Key;
   /**
    * Custom resource lambda log retention in days
    */
-  readonly logRetentionInDays: number;
+  readonly logRetentionInDays?: number;
 }
 
 export class ResolverRule extends cdk.Resource implements IResolverRule {
@@ -91,9 +91,14 @@ export class ResolverRule extends cdk.Resource implements IResolverRule {
     super(scope, id);
 
     this.name = props.name;
-    props.tags?.push({ key: 'Name', value: this.name });
 
     if (props.targetInbound) {
+      if (!props.kmsKey) {
+        throw new Error(`kmsKey property must be included if targetInbound property is defined.`);
+      }
+      if (!props.logRetentionInDays) {
+        throw new Error(`logRetentionInDays property must be included if targetInbound property is defined.`);
+      }
       this.targetIps = this.lookupInbound(props.targetInbound, props.kmsKey, props.logRetentionInDays);
     } else {
       this.targetIps = props.targetIps;
@@ -101,11 +106,13 @@ export class ResolverRule extends cdk.Resource implements IResolverRule {
 
     const resource = new cdk.aws_route53resolver.CfnResolverRule(this, 'Resource', {
       domainName: props.domainName,
-      resolverEndpointId: props.resolverEndpointId,
+      resolverEndpointId: props.ruleType === 'SYSTEM' ? undefined : props.resolverEndpointId,
       ruleType: props.ruleType ?? 'FORWARD',
+      name: this.name,
       targetIps: this.targetIps,
       tags: props.tags,
     });
+    cdk.Tags.of(this).add('Name', this.name);
 
     this.ruleArn = resource.attrArn;
     this.ruleId = resource.attrResolverRuleId;

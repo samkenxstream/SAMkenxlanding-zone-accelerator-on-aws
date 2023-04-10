@@ -31,15 +31,18 @@ export async function handler(event: AWSLambda.CloudFormationCustomResourceEvent
   const region = event.ResourceProperties['region'];
   const partition = event.ResourceProperties['partition'];
   const adminAccountId = event.ResourceProperties['adminAccountId'];
+  const solutionId = process.env['SOLUTION_ID'];
 
   let organizationsClient: AWS.Organizations;
   if (partition === 'aws-us-gov') {
-    organizationsClient = new AWS.Organizations({ region: 'us-gov-west-1' });
+    organizationsClient = new AWS.Organizations({ region: 'us-gov-west-1', customUserAgent: solutionId });
+  } else if (partition === 'aws-cn') {
+    organizationsClient = new AWS.Organizations({ region: 'cn-northwest-1', customUserAgent: solutionId });
   } else {
-    organizationsClient = new AWS.Organizations({ region: 'us-east-1' });
+    organizationsClient = new AWS.Organizations({ region: 'us-east-1', customUserAgent: solutionId });
   }
 
-  const macie2Client = new AWS.Macie2({ region: region });
+  const macie2Client = new AWS.Macie2({ region: region, customUserAgent: solutionId });
   const allAccounts: AWS.Organizations.Account[] = [];
   const existingMembers: AWS.Macie2.Member[] = [];
   let isEnabled = false;
@@ -76,8 +79,8 @@ export async function handler(event: AWSLambda.CloudFormationCustomResourceEvent
         );
       }
 
-      for (const account of allAccounts.filter(account => account.Id !== adminAccountId) ?? []) {
-        if (!existingMembers!.find(member => member.accountId !== account.Id)) {
+      for (const account of allAccounts.filter(item => item.Id !== adminAccountId) ?? []) {
+        if (!existingMembers.find(member => member.accountId !== account.Id)) {
           console.log(`OU account - ${account.Id} macie membership status is "not a macie member", adding as a member`);
           await throttlingBackOff(() =>
             macie2Client
@@ -102,8 +105,8 @@ export async function handler(event: AWSLambda.CloudFormationCustomResourceEvent
       }
       return { Status: 'Success', StatusCode: 200 };
     case 'Delete':
-      for (const account of allAccounts.filter(account => account.Id !== adminAccountId) ?? []) {
-        if (existingMembers!.find(member => member.accountId !== account.Id)) {
+      for (const account of allAccounts.filter(item => item.Id !== adminAccountId) ?? []) {
+        if (existingMembers.find(member => member.accountId !== account.Id)) {
           console.log(
             `OU account - ${account.Id} macie membership status is "a macie member", removing from member list`,
           );
@@ -153,6 +156,17 @@ async function isMacieEnable(macie2Client: AWS.Macie2): Promise<boolean> {
       e.code === 'ResourceConflictException' ||
       // SDKv3 Error Structure
       e.name === 'ResourceConflictException'
+    ) {
+      console.warn(e.name + ': ' + e.message);
+      return false;
+    }
+
+    // This is required when macie is not enabled AccessDeniedException exception issues
+    if (
+      // SDKv2 Error Structure
+      e.code === 'AccessDeniedException' ||
+      // SDKv3 Error Structure
+      e.name === 'AccessDeniedException'
     ) {
       console.warn(e.name + ': ' + e.message);
       return false;

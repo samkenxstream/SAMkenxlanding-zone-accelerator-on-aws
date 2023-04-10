@@ -1,5 +1,5 @@
-# If using AWS Control Tower, ensure that all the specified Organizational Units (OU) 
-# have been created and enrolled as the accelerator will verify that the OU layout 
+# If using AWS Control Tower, ensure that all the specified Organizational Units (OU)
+# have been created and enrolled as the accelerator will verify that the OU layout
 # matches before continuing to execute the deployment pipeline.
 
 enable: true
@@ -35,6 +35,7 @@ serviceControlPolicies:
     type: customerManaged
     deploymentTargets:
       organizationalUnits: []
+# https://docs.aws.amazon.com/organizations/latest/userguide/orgs_manage_policies_tag-policies.html
 taggingPolicies:
   - name: TagPolicy
     description: Organization Tagging Policy
@@ -42,10 +43,14 @@ taggingPolicies:
     deploymentTargets:
       organizationalUnits:
         - Root
+# https://docs.aws.amazon.com/organizations/latest/userguide/orgs_manage_policies_backup.html
+# backup policies contain a `delete_after_days` value of 1095 days, or 3 years.  Before
+# enabling this policy, ensure that `delete_after_days` meets your organization's records retention
+# policies.  Similarly, ensure that `move_to_cold_storage_after_days` meets business requirements.
 backupPolicies:
   - name: BackupPolicy
     description: Organization Backup Policy
-    policy: backup-policies/org-backup-policies.json
+    policy: backup-policies/backup-plan.json
     deploymentTargets:
       organizationalUnits:
         - Root

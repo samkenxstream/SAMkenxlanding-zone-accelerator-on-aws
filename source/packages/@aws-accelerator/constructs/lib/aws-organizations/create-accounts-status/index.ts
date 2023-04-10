@@ -25,6 +25,7 @@ const documentClient = new AWS.DynamoDB.DocumentClient();
 const newOrgAccountsTableName = process.env['NewOrgAccountsTableName'] ?? '';
 const govCloudAccountMappingTableName = process.env['GovCloudAccountMappingTableName'] ?? '';
 const accountRoleName = process.env['AccountRoleName'];
+const solutionId = process.env['SOLUTION_ID'] ?? '';
 
 interface AccountConfig {
   name: string;
@@ -32,20 +33,30 @@ interface AccountConfig {
   email: string;
   enableGovCloud: string;
   organizationalUnitId: string;
-  createRequestId?: string | undefined;
+  createRequestId?: string;
 }
 
 type AccountConfigs = Array<AccountConfig>;
-
-const organizationsClient = new AWS.Organizations({ region: 'us-east-1' });
+let organizationsClient: AWS.Organizations;
 
 //eslint-disable-next-line @typescript-eslint/no-explicit-any
-export async function handler(event: any): Promise<
+export async function handler(
+  event: AWSLambda.CloudFormationCustomResourceEvent,
+  context: AWSLambda.Context,
+): Promise<
   | {
       IsComplete: boolean;
     }
   | undefined
 > {
+  const partition = context.invokedFunctionArn.split(':')[1];
+
+  if (partition === 'aws-cn') {
+    organizationsClient = new AWS.Organizations({ region: 'cn-northwest-1', customUserAgent: solutionId });
+  } else {
+    organizationsClient = new AWS.Organizations({ region: 'us-east-1', customUserAgent: solutionId });
+  }
+
   console.log(event);
   // get a single accountConfig from table and attempt to create
   // if no record is returned then all new accounts are provisioned
@@ -157,7 +168,8 @@ async function getSingleAccountConfigFromTable(): Promise<AccountConfigs> {
   const response = await throttlingBackOff(() => documentClient.scan(scanParams).promise());
 
   console.log(`getSingleAccount response ${JSON.stringify(response)}`);
-  if (response.Items?.length ?? 0 > 0) {
+  const itemCount = response.Items?.length ?? 0;
+  if (itemCount > 0) {
     const account: AccountConfig = JSON.parse(response.Items![0]['accountConfig']);
     accountToAdd.push(account);
     console.log(`Account to add ${JSON.stringify(accountToAdd)}`);
@@ -216,13 +228,11 @@ async function createGovCloudAccount(
 async function getAccountCreationStatus(
   requestId: string,
 ): Promise<AWS.Organizations.DescribeCreateAccountStatusResponse> {
-  const response = await throttlingBackOff(() =>
+  return throttlingBackOff(() =>
     organizationsClient.describeCreateAccountStatus({ CreateAccountRequestId: requestId }).promise(),
   );
-  return response;
 }
 
-// TODO: Fix use update
 async function updateAccountConfig(accountConfig: AccountConfig): Promise<boolean> {
   const params = {
     TableName: newOrgAccountsTableName,
@@ -285,22 +295,22 @@ async function saveGovCloudAccountMapping(
   }
 }
 
-async function deleteAllRecordsFromTable(tableName: string) {
+async function deleteAllRecordsFromTable(paramTableName: string) {
   const params = {
-    TableName: tableName,
+    TableName: paramTableName,
     ProjectionExpression: 'accountEmail',
   };
   const response = await documentClient.scan(params).promise();
   if (response.Items) {
     for (const item of response.Items) {
       console.log(item['accountEmail']);
-      const params = {
-        TableName: tableName,
+      const itemParams = {
+        TableName: paramTableName,
         Key: {
           accountEmail: item['accountEmail'],
         },
       };
-      await documentClient.delete(params).promise();
+      await documentClient.delete(itemParams).promise();
     }
   }
 }

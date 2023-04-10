@@ -1,0 +1,51 @@
+// Jest Snapshot v1, https://goo.gl/fbAQLP
+
+exports[`BudgetDefinition Construct(BudgetDefinition):  Snapshot Test 1`] = `
+{
+  "Resources": {
+    "TestBudgetDefinitionaccelbudgetBE1AA96C": {
+      "Properties": {
+        "Budget": {
+          "BudgetLimit": {
+            "Amount": 2000,
+            "Unit": "USD",
+          },
+          "BudgetName": "accel-budget",
+          "BudgetType": "COST",
+          "CostTypes": {
+            "IncludeCredit": false,
+            "IncludeDiscount": true,
+            "IncludeOtherSubscription": true,
+            "IncludeRecurring": true,
+            "IncludeRefund": false,
+            "IncludeSubscription": true,
+            "IncludeSupport": true,
+            "IncludeTax": true,
+            "IncludeUpfront": true,
+            "UseAmortized": false,
+            "UseBlended": false,
+          },
+          "TimeUnit": "MONTHLY",
+        },
+        "NotificationsWithSubscribers": [
+          {
+            "Notification": {
+              "ComparisonOperator": "GREATER_THAN",
+              "NotificationType": "ACTUAL",
+              "Threshold": 100,
+              "ThresholdType": "PERCENTAGE",
+            },
+            "Subscribers": [
+              {
+                "Address": "myemail+pa-budg@example.com",
+                "SubscriptionType": "EMAIL",
+              },
+            ],
+          },
+        ],
+      },
+      "Type": "AWS::Budgets::Budget",
+    },
+  },
+}
+`;

@@ -32,13 +32,18 @@ export async function handler(event: AWSLambda.CloudFormationCustomResourceEvent
   const targetId: string = event.ResourceProperties['targetId'] ?? undefined;
   const type: string = event.ResourceProperties['type'];
   const partition: string = event.ResourceProperties['partition'];
+  const solutionId = process.env['SOLUTION_ID'];
 
   let organizationsClient: AWS.Organizations;
   if (partition === 'aws-us-gov') {
-    organizationsClient = new AWS.Organizations({ region: 'us-gov-west-1' });
+    organizationsClient = new AWS.Organizations({ region: 'us-gov-west-1', customUserAgent: solutionId });
+  } else if (partition === 'aws-cn') {
+    organizationsClient = new AWS.Organizations({ region: 'cn-northwest-1', customUserAgent: solutionId });
   } else {
-    organizationsClient = new AWS.Organizations({ region: 'us-east-1' });
+    organizationsClient = new AWS.Organizations({ region: 'us-east-1', customUserAgent: solutionId });
   }
+
+  let nextToken: string | undefined = undefined;
 
   switch (event.RequestType) {
     case 'Create':
@@ -46,12 +51,12 @@ export async function handler(event: AWSLambda.CloudFormationCustomResourceEvent
       //
       // Check if already exists, update and return the ID
       //
-      let nextToken: string | undefined = undefined;
       do {
-        const page = await throttlingBackOff(() =>
-          organizationsClient
-            .listPoliciesForTarget({ Filter: type, TargetId: targetId, NextToken: nextToken })
-            .promise(),
+        const page: AWS.Organizations.ListPoliciesForTargetResponse = await getListPoliciesForTarget(
+          organizationsClient,
+          type,
+          targetId,
+          nextToken,
         );
         for (const policy of page.Policies ?? []) {
           if (policy.Id === policyId) {
@@ -81,15 +86,14 @@ export async function handler(event: AWSLambda.CloudFormationCustomResourceEvent
       //
       // Detach policy, let CDK manage where it's deployed,
       //
-
       // do not remove FullAWSAccess
       if (policyId !== 'p-FullAWSAccess') {
-        let nextToken: string | undefined = undefined;
         do {
-          const page = await throttlingBackOff(() =>
-            organizationsClient
-              .listPoliciesForTarget({ Filter: type, TargetId: targetId, NextToken: nextToken })
-              .promise(),
+          const page: AWS.Organizations.ListPoliciesForTargetResponse = await getListPoliciesForTarget(
+            organizationsClient,
+            type,
+            targetId,
+            nextToken,
           );
           for (const policy of page.Policies ?? []) {
             if (policy.Id === policyId) {
@@ -107,4 +111,15 @@ export async function handler(event: AWSLambda.CloudFormationCustomResourceEvent
         Status: 'SUCCESS',
       };
   }
+}
+
+async function getListPoliciesForTarget(
+  organizationsClient: AWS.Organizations,
+  type: string,
+  targetId: string,
+  nextToken?: string,
+): Promise<AWS.Organizations.ListPoliciesForTargetResponse> {
+  return throttlingBackOff(() =>
+    organizationsClient.listPoliciesForTarget({ Filter: type, TargetId: targetId, NextToken: nextToken }).promise(),
+  );
 }

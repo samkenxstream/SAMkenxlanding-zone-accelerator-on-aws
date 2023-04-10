@@ -32,8 +32,9 @@ export async function handler(event: AWSLambda.CloudFormationCustomResourceEvent
   const bucketName = event.ResourceProperties['bucketName'];
   const keyPrefix = event.ResourceProperties['keyPrefix'];
   const kmsKeyArn = event.ResourceProperties['kmsKeyArn'];
+  const solutionId = process.env['SOLUTION_ID'];
 
-  const macie2Client = new AWS.Macie2({ region: region });
+  const macie2Client = new AWS.Macie2({ region: region, customUserAgent: solutionId });
 
   switch (event.RequestType) {
     case 'Create':
@@ -84,6 +85,18 @@ async function isMacieEnable(macie2Client: AWS.Macie2): Promise<boolean> {
       console.warn(e.name + ': ' + e.message);
       return false;
     }
+
+    // This is required when macie is not enabled AccessDeniedException exception issues
+    if (
+      // SDKv2 Error Structure
+      e.code === 'AccessDeniedException' ||
+      // SDKv3 Error Structure
+      e.name === 'AccessDeniedException'
+    ) {
+      console.warn(e.name + ': ' + e.message);
+      return false;
+    }
+
     throw new Error(`Macie enable issue error message - ${e}`);
   }
 }

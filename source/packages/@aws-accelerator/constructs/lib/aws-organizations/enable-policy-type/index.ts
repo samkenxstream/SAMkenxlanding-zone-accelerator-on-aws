@@ -32,30 +32,31 @@ export async function handler(event: AWSLambda.CloudFormationCustomResourceEvent
     case 'Create':
       const policyType = event.ResourceProperties['policyType'];
       const partition = event.ResourceProperties['partition'];
+      const solutionId = process.env['SOLUTION_ID'];
+
+      if (partition === 'aws-us-gov' && policyType == ('TAG_POLICY' || 'BACKUP_POLICY')) {
+        throw new Error(`Policy Type ${policyType} not supported.`);
+      }
 
       //
       // Obtain an Organizations client
       //
       let organizationsClient: AWS.Organizations;
       if (partition === 'aws-us-gov') {
-        organizationsClient = new AWS.Organizations({ region: 'us-gov-west-1' });
+        organizationsClient = new AWS.Organizations({ region: 'us-gov-west-1', customUserAgent: solutionId });
+      } else if (partition === 'aws-cn') {
+        organizationsClient = new AWS.Organizations({ region: 'cn-northwest-1', customUserAgent: solutionId });
       } else {
-        organizationsClient = new AWS.Organizations({ region: 'us-east-1' });
+        organizationsClient = new AWS.Organizations({ region: 'us-east-1', customUserAgent: solutionId });
       }
 
       // Verify policy type from the listRoots call
       let nextToken: string | undefined = undefined;
       do {
         const page = await throttlingBackOff(() => organizationsClient.listRoots({ NextToken: nextToken }).promise());
-        for (const item of page.Roots ?? []) {
-          if (
-            partition === 'aws-us-gov' &&
-            item.PolicyTypes?.find(item => item.Type === 'TAG_POLICY' || 'BACKUP_POLICY')
-          ) {
-            throw new Error(`Policy Type ${policyType} not supported.`);
-          }
-          if (item.Name === 'Root') {
-            if (item.PolicyTypes?.find(item => item.Type === policyType && item.Status === 'ENABLED')) {
+        for (const orgRoot of page.Roots ?? []) {
+          if (orgRoot.Name === 'Root') {
+            if (orgRoot.PolicyTypes?.find(item => item.Type === policyType && item.Status === 'ENABLED')) {
               return {
                 PhysicalResourceId: policyType,
                 Status: 'SUCCESS',
@@ -63,7 +64,7 @@ export async function handler(event: AWSLambda.CloudFormationCustomResourceEvent
             }
 
             await throttlingBackOff(() =>
-              organizationsClient.enablePolicyType({ PolicyType: policyType, RootId: item.Id! }).promise(),
+              organizationsClient.enablePolicyType({ PolicyType: policyType, RootId: orgRoot.Id! }).promise(),
             );
 
             return {

@@ -23,6 +23,7 @@ import {
   DynamoDBDocumentPaginationConfiguration,
 } from '@aws-sdk/lib-dynamodb';
 import { CloudFormationClient, DescribeStacksCommand } from '@aws-sdk/client-cloudformation';
+import { SSMClient, GetParameterCommand } from '@aws-sdk/client-ssm';
 import { throttlingBackOff } from '@aws-accelerator/utils';
 
 const marshallOptions = {
@@ -35,15 +36,13 @@ const unmarshallOptions = {
   wrapNumbers: false,
 };
 const translateConfig = { marshallOptions, unmarshallOptions };
-const dynamodbClient = new DynamoDBClient({});
-const documentClient = DynamoDBDocumentClient.from(dynamodbClient, translateConfig);
-const serviceCatalogClient = new AWS.ServiceCatalog();
-const cloudformationClient = new CloudFormationClient({});
+let paginationConfig: DynamoDBDocumentPaginationConfiguration;
+let dynamodbClient: DynamoDBClient;
+let documentClient: DynamoDBDocumentClient;
+let serviceCatalogClient: AWS.ServiceCatalog;
+let cloudformationClient: CloudFormationClient;
+let ssmClient: SSMClient;
 let organizationsClient: AWS.Organizations;
-const paginationConfig: DynamoDBDocumentPaginationConfiguration = {
-  client: documentClient,
-  pageSize: 100,
-};
 
 type AccountToAdd = {
   name: string;
@@ -53,7 +52,14 @@ type AccountToAdd = {
   organizationalUnitId: string;
 };
 
-type OrganizationalUnitKeys = {
+type ConfigOrganizationalUnitKeys = {
+  acceleratorKey: string;
+  awsKey: string;
+  registered: boolean | undefined;
+  ignore: boolean;
+};
+
+type AwsOrganizationalUnitKeys = {
   acceleratorKey: string;
   awsKey: string;
 };
@@ -64,12 +70,25 @@ type DDBItem = {
 };
 type DDBItems = Array<DDBItem>;
 
+const validationErrors: string[] = [];
+const ctAccountsToAdd: DDBItems = [];
+const orgAccountsToAdd: DDBItems = [];
+let mandatoryAccounts: DDBItems = [];
+let workloadAccounts: DDBItems = [];
+let organizationAccounts: AWS.Organizations.Account[] = [];
+let configAllOuKeys: ConfigOrganizationalUnitKeys[] = [];
+let configActiveOuKeys: ConfigOrganizationalUnitKeys[] = [];
+let configIgnoredOuKeys: ConfigOrganizationalUnitKeys[] = [];
+const awsOuKeys: AwsOrganizationalUnitKeys[] = [];
+let driftDetectionParameterName = '';
+let driftDetectionMessageParameterName = '';
+
 /**
-* validate-environment - lambda handler
-*
-* @param event
-* @returns
-*/
+ * validate-environment - lambda handler
+ *
+ * @param event
+ * @returns
+ */
 export async function handler(event: AWSLambda.CloudFormationCustomResourceEvent): Promise<
   | {
       Status: string;
@@ -81,17 +100,31 @@ export async function handler(event: AWSLambda.CloudFormationCustomResourceEvent
   const newOrgAccountsTableName = event.ResourceProperties['newOrgAccountsTableName'];
   const newCTAccountsTableName = event.ResourceProperties['newCTAccountsTableName'];
   const controlTowerEnabled = event.ResourceProperties['controlTowerEnabled'];
+  const organizationsEnabled = event.ResourceProperties['organizationsEnabled'];
   const commitId = event.ResourceProperties['commitId'];
   const stackName = event.ResourceProperties['stackName'];
-  const validationErrors: string[] = [];
-  const ctAccountsToAdd = [];
-  const orgAccountsToAdd = [];
+  driftDetectionParameterName = event.ResourceProperties['driftDetectionParameterName'];
+  driftDetectionMessageParameterName = event.ResourceProperties['driftDetectionMessageParameterName'];
+
+  const solutionId = process.env['SOLUTION_ID'];
 
   if (partition === 'aws-us-gov') {
     organizationsClient = new AWS.Organizations({ region: 'us-gov-west-1' });
+  } else if (partition === 'aws-cn') {
+    organizationsClient = new AWS.Organizations({ region: 'cn-northwest-1' });
   } else {
-    organizationsClient = new AWS.Organizations({ region: 'us-east-1' });
+    organizationsClient = new AWS.Organizations({ region: 'us-east-1', customUserAgent: solutionId });
   }
+
+  dynamodbClient = new DynamoDBClient({ customUserAgent: solutionId });
+  documentClient = DynamoDBDocumentClient.from(dynamodbClient, translateConfig);
+  serviceCatalogClient = new AWS.ServiceCatalog({ customUserAgent: solutionId });
+  cloudformationClient = new CloudFormationClient({ customUserAgent: solutionId });
+  ssmClient = new SSMClient({});
+  paginationConfig = {
+    client: documentClient,
+    pageSize: 100,
+  };
 
   console.log(stackName);
   switch (event.RequestType) {
@@ -108,130 +141,88 @@ export async function handler(event: AWSLambda.CloudFormationCustomResourceEvent
         };
       }
       console.log(`Configuration repository commit id ${commitId}`);
-      // get accounts from organizations
-      const organizationAccounts = await getOrganizationAccounts();
 
-      const mandatoryAccounts = await getConfigFromTableForCommit(configTableName, 'mandatoryAccount', commitId);
-      const workloadAccounts = await getConfigFromTableForCommit(configTableName, 'workloadAccount', commitId);
-      if (controlTowerEnabled === 'true' && mandatoryAccounts) {
-        // confirm mandatory accounts exist in aws
-        for (const mandatoryAccount of mandatoryAccounts) {
-          const existingAccount = organizationAccounts.find(item => item.Email == mandatoryAccount['acceleratorKey']);
-          if (existingAccount?.Status == 'ACTIVE') {
-            console.log(`Mandatory Account ${mandatoryAccount['acceleratorKey']} exists.`);
-          } else {
-            validationErrors.push(
-              `Mandatory account ${mandatoryAccount['acceleratorKey']} does not exist in AWS or is suspended`,
-            );
-          }
-        }
+      if (organizationsEnabled) {
+        configAllOuKeys = await getConfigOuKeys(configTableName, commitId);
+        configActiveOuKeys = configAllOuKeys.filter(item => item.ignore === false);
+        configIgnoredOuKeys = configAllOuKeys.filter(item => item.ignore === true);
 
-        const validateOrganizationalUnits = await validateOrganizationalUnitsExist(configTableName, commitId);
-        validationErrors.push(...validateOrganizationalUnits);
+        console.debug('Active OU List', configActiveOuKeys);
+        console.debug('Ignored OU List', configIgnoredOuKeys);
 
-        const validateAccountsAreInOu = await validateAccountsInOu(configTableName, commitId);
-        validationErrors.push(...validateAccountsAreInOu);
-
-        // retrieve all of the accounts provisioned in control tower
-        const provisionedControlTowerAccounts = await getControlTowerProvisionedAccounts();
-        // confirm workload accounts exist in control tower without errors
-        if (workloadAccounts) {
-          for (const workloadAccount of workloadAccounts) {
-            const accountConfig = JSON.parse(workloadAccount['dataBag']);
-            const accountName = accountConfig['name'];
-            const provisionedControlTowerAccount = provisionedControlTowerAccounts.find(
-              pcta => pcta.Name == accountName,
-            );
-            if (provisionedControlTowerAccount) {
-              switch (provisionedControlTowerAccount['Status']) {
-                case 'AVAILABLE':
-                  break;
-                case 'TAINTED':
-                  validationErrors.push(
-                    `AWS Account ${workloadAccount['acceleratorKey']} is TAINTED state. Message: ${provisionedControlTowerAccount.StatusMessage}. Check Service Catalog`,
-                  );
-                  break;
-                case 'ERROR':
-                  validationErrors.push(
-                    `AWS Account ${workloadAccount['acceleratorKey']} is in ERROR state. Message: ${provisionedControlTowerAccount.StatusMessage}. Check Service Catalog`,
-                  );
-                  break;
-                case 'UNDER_CHANGE':
-                  break;
-                case 'PLAN_IN_PROGRESS':
-                  break;
-              }
-            } else {
-              // confirm account doesn't exist in control tower with a different name
-              // if enrolled directly in console the name in service catalog won't match
-              // look up by physical id if it exists
-              const checkAccountId = organizationAccounts.find(oa => oa.Email == workloadAccount['acceleratorKey']);
-              if (checkAccountId) {
-                const provisionedControlTowerAccount = provisionedControlTowerAccounts.find(
-                  pcta => pcta.PhysicalId === checkAccountId.Id,
-                );
-                if (
-                  provisionedControlTowerAccount?.Status === 'TAINTED' ||
-                  provisionedControlTowerAccount?.Status === 'ERROR'
-                ) {
-                  validationErrors.push(
-                    `AWS Account ${workloadAccount['acceleratorKey']} is in ERROR state. Message: ${provisionedControlTowerAccount.StatusMessage}. Check Service Catalog`,
-                  );
-                }
-                if (!provisionedControlTowerAccount) {
-                  ctAccountsToAdd.push(workloadAccount);
-                }
-              } else {
-                ctAccountsToAdd.push(workloadAccount);
-              }
-            }
-          }
-        }
+        await getAwsOrganizationalUnitKeys(await getRootId(), '');
+        // get accounts from organizations
+        organizationAccounts = await getOrganizationAccounts(configActiveOuKeys);
       }
+
+      mandatoryAccounts = await getConfigFromTableForCommit(configTableName, 'mandatoryAccount', commitId);
+      workloadAccounts = await getConfigFromTableForCommit(configTableName, 'workloadAccount', commitId);
+
+      if (controlTowerEnabled === 'true') {
+        await validateControlTower();
+      }
+
+      const allOuInConfigErrors = await validateAllOuInConfig();
+      validationErrors.push(...allOuInConfigErrors);
+
+      const validateOrganizationalUnits = await validateOrganizationalUnitsExist(configActiveOuKeys);
+      validationErrors.push(...validateOrganizationalUnits);
+
+      const validateAccountsAreInOu = await validateAccountsInOu(configTableName, configActiveOuKeys);
+      validationErrors.push(...validateAccountsAreInOu);
+
+      const validateAllAwsAccountsAreInConfig = await validateAllAwsAccountsInConfig();
+      validationErrors.push(...validateAllAwsAccountsAreInConfig);
 
       // find organization accounts that need to be created
       console.log(`controlTowerEnabled value: ${controlTowerEnabled}`);
       if (controlTowerEnabled === 'false' && mandatoryAccounts) {
         for (const mandatoryAccount of mandatoryAccounts) {
-          const mandatoryOrganizationAccount = organizationAccounts.find(
-            item => item.Email == mandatoryAccount['acceleratorKey'],
-          );
-          if (mandatoryOrganizationAccount) {
-            if (mandatoryOrganizationAccount.Status !== 'ACTIVE') {
-              validationErrors.push(
-                `Mandatory account ${mandatoryAccount['acceleratorKey']} is in ${mandatoryOrganizationAccount.Status}`,
-              );
+          const awsOuKey = configAllOuKeys.find(ouKeyItem => ouKeyItem.acceleratorKey === mandatoryAccount['ouName']);
+          if (awsOuKey?.ignore === false) {
+            const mandatoryOrganizationAccount = organizationAccounts.find(
+              item => item.Email == mandatoryAccount['acceleratorKey'],
+            );
+            if (mandatoryOrganizationAccount) {
+              if (mandatoryOrganizationAccount.Status !== 'ACTIVE') {
+                validationErrors.push(
+                  `Mandatory account ${mandatoryAccount['acceleratorKey']} is in ${mandatoryOrganizationAccount.Status}`,
+                );
+              }
+            } else {
+              orgAccountsToAdd.push(mandatoryAccount);
             }
-          } else {
-            orgAccountsToAdd.push(mandatoryAccount);
           }
         }
       }
       if (workloadAccounts) {
         for (const workloadAccount of workloadAccounts) {
-          const organizationAccount = organizationAccounts.find(
-            item => item.Email == workloadAccount['acceleratorKey'],
-          );
-          if (organizationAccount) {
-            if (organizationAccount.Status !== 'ACTIVE') {
-              validationErrors.push(
-                `Workload account ${workloadAccount['acceleratorKey']} is in ${organizationAccount.Status}`,
-              );
-            }
-          } else {
-            const accountConfig = JSON.parse(workloadAccount['dataBag']);
-            if (controlTowerEnabled === 'false' || accountConfig['enableGovCloud']) {
-              orgAccountsToAdd.push(workloadAccount);
+          const awsOuKey = configAllOuKeys.find(ouKeyItem => ouKeyItem.acceleratorKey === workloadAccount['ouName']);
+          if (awsOuKey?.ignore === false) {
+            const organizationAccount = organizationAccounts.find(
+              item => item.Email == workloadAccount['acceleratorKey'],
+            );
+            if (organizationAccount) {
+              if (organizationAccount.Status !== 'ACTIVE') {
+                validationErrors.push(
+                  `Workload account ${workloadAccount['acceleratorKey']} is in ${organizationAccount.Status}`,
+                );
+              }
+            } else {
+              const accountConfig = JSON.parse(workloadAccount['dataBag']);
+              if (controlTowerEnabled === 'false' || accountConfig['enableGovCloud']) {
+                // check against ignored
+                orgAccountsToAdd.push(workloadAccount);
+              }
             }
           }
         }
       }
 
-      const organizationalUnitKeys = await getOUKeys(configTableName, commitId);
       // put accounts to create in DynamoDb
       console.log(`Org Accounts to add: ${JSON.stringify(orgAccountsToAdd)}`);
       for (const account of orgAccountsToAdd) {
-        const accountOu = organizationalUnitKeys.find(item => item.acceleratorKey === account['ouName']);
+        const accountOu = configActiveOuKeys.find(item => item.acceleratorKey === account['ouName']);
         const parsedDataBag = JSON.parse(account['dataBag']);
         let accountConfig: AccountToAdd;
         if (accountOu?.awsKey) {
@@ -252,13 +243,15 @@ export async function handler(event: AWSLambda.CloudFormationCustomResourceEvent
           await throttlingBackOff(() => documentClient.send(new PutCommand(params)));
         } else {
           // should not get here we just created and validated all of the ou's.
-          validationErrors.push(`Unable to find Organizational Unit ${account['ouName']} in configuration`);
+          validationErrors.push(
+            `Unable to find Organizational Unit ${account['ouName']} in configuration or OU ignore property is set to true`,
+          );
         }
       }
 
       console.log(`CT Accounts to add: ${JSON.stringify(ctAccountsToAdd)}`);
       for (const account of ctAccountsToAdd) {
-        const accountOu = organizationalUnitKeys.find(item => item.acceleratorKey === account['ouName']);
+        const accountOu = configActiveOuKeys.find(item => item.acceleratorKey === account['ouName']);
         const parsedDataBag = JSON.parse(account['dataBag']);
         let accountConfig: AccountToAdd;
         if (accountOu?.awsKey) {
@@ -266,7 +259,8 @@ export async function handler(event: AWSLambda.CloudFormationCustomResourceEvent
             name: parsedDataBag['name'],
             email: account['acceleratorKey'],
             description: parsedDataBag['description'],
-            organizationalUnitId: await getOuName(account['ouName']),
+            // formatting for CT requirements to support nested ou's
+            organizationalUnitId: (await getOuName(account['ouName'])) + ` (${accountOu.awsKey})`,
           };
           const params: PutCommandInput = {
             TableName: newCTAccountsTableName,
@@ -278,7 +272,9 @@ export async function handler(event: AWSLambda.CloudFormationCustomResourceEvent
           await throttlingBackOff(() => documentClient.send(new PutCommand(params)));
         } else {
           // should not get here we just created and validated all of the ou's.
-          validationErrors.push(`Unable to find Organizational Unit ${account['ouName']} in configuration`);
+          validationErrors.push(
+            `Unable to find Organizational Unit ${account['ouName']} in configuration or OU ignore property is set to true`,
+          );
         }
       }
 
@@ -297,6 +293,98 @@ export async function handler(event: AWSLambda.CloudFormationCustomResourceEvent
       return {
         Status: 'SUCCESS',
       };
+  }
+}
+
+async function validateControlTower() {
+  // confirm mandatory accounts exist in aws
+  for (const mandatoryAccount of mandatoryAccounts) {
+    const existingAccount = organizationAccounts.find(item => item.Email == mandatoryAccount['acceleratorKey']);
+    if (existingAccount?.Status == 'ACTIVE') {
+      console.log(`Mandatory Account ${mandatoryAccount['acceleratorKey']} exists.`);
+    } else {
+      validationErrors.push(
+        `Mandatory account ${mandatoryAccount['acceleratorKey']} does not exist in AWS or is suspended`,
+      );
+    }
+  }
+
+  // validate that no ou's are deregistered
+  const validateOrganizationalUnitsRegistered = await validateOrganizationalUnitsAreRegistered(configActiveOuKeys);
+  validationErrors.push(...validateOrganizationalUnitsRegistered);
+
+  // check for control tower drift
+  const driftDetected = await throttlingBackOff(() =>
+    ssmClient.send(
+      new GetParameterCommand({
+        Name: driftDetectionParameterName,
+      }),
+    ),
+  );
+
+  if (driftDetected.Parameter?.Value == 'true') {
+    const driftDetectedMessage = await throttlingBackOff(() =>
+      ssmClient.send(
+        new GetParameterCommand({
+          Name: driftDetectionMessageParameterName,
+        }),
+      ),
+    );
+    validationErrors.push(driftDetectedMessage.Parameter?.Value ?? '');
+  }
+
+  // retrieve all of the accounts provisioned in control tower
+  const provisionedControlTowerAccounts = await getControlTowerProvisionedAccounts();
+  // confirm workload accounts exist in control tower without errors
+  if (workloadAccounts) {
+    for (const workloadAccount of workloadAccounts) {
+      const accountConfig = JSON.parse(workloadAccount['dataBag']);
+      const accountName = accountConfig['name'];
+      const provisionedControlTowerAccount = provisionedControlTowerAccounts.find(pcta => pcta.Name == accountName);
+      if (provisionedControlTowerAccount) {
+        switch (provisionedControlTowerAccount['Status']) {
+          case 'AVAILABLE':
+            break;
+          case 'TAINTED':
+            validationErrors.push(
+              `AWS Account ${workloadAccount['acceleratorKey']} is TAINTED state. Message: ${provisionedControlTowerAccount.StatusMessage}. Check Service Catalog`,
+            );
+            break;
+          case 'ERROR':
+            validationErrors.push(
+              `AWS Account ${workloadAccount['acceleratorKey']} is in ERROR state. Message: ${provisionedControlTowerAccount.StatusMessage}. Check Service Catalog`,
+            );
+            break;
+          case 'UNDER_CHANGE':
+            break;
+          case 'PLAN_IN_PROGRESS':
+            break;
+        }
+      } else {
+        // confirm account doesn't exist in control tower with a different name
+        // if enrolled directly in console the name in service catalog won't match
+        // look up by physical id if it exists
+        const checkAccountId = organizationAccounts.find(oa => oa.Email == workloadAccount['acceleratorKey']);
+        if (checkAccountId) {
+          const provisionedControlTowerOrgAccount = provisionedControlTowerAccounts.find(
+            pcta => pcta.PhysicalId === checkAccountId.Id,
+          );
+          if (
+            provisionedControlTowerOrgAccount?.Status === 'TAINTED' ||
+            provisionedControlTowerOrgAccount?.Status === 'ERROR'
+          ) {
+            validationErrors.push(
+              `AWS Account ${workloadAccount['acceleratorKey']} is in ERROR state. Message: ${provisionedControlTowerOrgAccount.StatusMessage}. Check Service Catalog`,
+            );
+          }
+          if (!provisionedControlTowerOrgAccount) {
+            ctAccountsToAdd.push(workloadAccount);
+          }
+        } else {
+          ctAccountsToAdd.push(workloadAccount);
+        }
+      }
+    }
   }
 }
 
@@ -333,21 +421,29 @@ async function getControlTowerProvisionedAccounts(): Promise<AWS.ServiceCatalog.
     nextToken = page.NextPageToken;
   } while (nextToken);
 
-  //console.log(`Provisioned Control Tower Accounts ${JSON.stringify(provisionedProducts)}`);
   return provisionedProducts;
 }
 
-async function getOrganizationAccounts(): Promise<AWS.Organizations.Account[]> {
+async function getOrganizationAccounts(
+  organizationalUnitKeys: ConfigOrganizationalUnitKeys[],
+): Promise<AWS.Organizations.Account[]> {
   const organizationAccounts: AWS.Organizations.Account[] = [];
-  let nextToken: string | undefined = undefined;
-  do {
-    const page = await throttlingBackOff(() => organizationsClient.listAccounts({ NextToken: nextToken }).promise());
-    for (const account of page.Accounts ?? []) {
-      organizationAccounts.push(account);
+  for (const ouKey of organizationalUnitKeys) {
+    if (!ouKey.awsKey) {
+      validationErrors.push(`Organizational Unit "${ouKey.acceleratorKey}" not found.`);
+      continue;
     }
-    nextToken = page.NextToken;
-  } while (nextToken);
-
+    let nextToken: string | undefined = undefined;
+    do {
+      const page = await throttlingBackOff(() =>
+        organizationsClient.listAccountsForParent({ ParentId: ouKey.awsKey, NextToken: nextToken }).promise(),
+      );
+      for (const account of page.Accounts ?? []) {
+        organizationAccounts.push(account);
+      }
+      nextToken = page.NextToken;
+    } while (nextToken);
+  }
   return organizationAccounts;
 }
 
@@ -377,26 +473,62 @@ async function getConfigFromTableForCommit(
   return items;
 }
 
-async function validateOrganizationalUnitsExist(configTableName: string, commitId: string): Promise<string[]> {
+async function validateOrganizationalUnitsExist(
+  organizationalUnitKeys: ConfigOrganizationalUnitKeys[],
+): Promise<string[]> {
   const errors: string[] = [];
-  const organizationalUnitKeys = await getOUKeys(configTableName, commitId);
   const missingOrganizationalUnits = organizationalUnitKeys.filter(item => item.awsKey === undefined);
 
   if (missingOrganizationalUnits.length > 0) {
     for (const item of missingOrganizationalUnits) {
       console.log(`Organizational Unit ${item.acceleratorKey} does not exist in AWS`);
       errors.push(
-        `Organizational Unit ${item.acceleratorKey} does not exist in AWS. Either remove from configuration or add OU via console`,
+        `Organizational Unit ${item.acceleratorKey} does not exist in AWS. Either remove from configuration or add OU via console.`,
       );
     }
   }
   return errors;
 }
 
-async function validateAccountsInOu(configTableName: string, commitId: string): Promise<string[]> {
+async function validateOrganizationalUnitsAreRegistered(
+  organizationalUnitKeys: ConfigOrganizationalUnitKeys[],
+): Promise<string[]> {
+  const errors: string[] = [];
+  const deregisteredOrganizationalUnits = organizationalUnitKeys.filter(item => item.registered === false);
+  if (deregisteredOrganizationalUnits.length > 0) {
+    for (const item of deregisteredOrganizationalUnits) {
+      console.log(`Organizational Unit ${item.acceleratorKey} may not be registered in Control Tower`);
+      errors.push(
+        `Organizational Unit ${item.acceleratorKey} may not be registered in Control Tower. Re-register OU in Control Tower to resolve.`,
+      );
+    }
+  }
+  // look for ou's that don't have a registration status
+  // confirm top level ou's have at least one guardrail attached
+  for (const ouKey of organizationalUnitKeys) {
+    if (ouKey.registered || !ouKey.awsKey || ouKey.acceleratorKey.split('/').length >>> 1) {
+      continue;
+    }
+    console.log('OU without registration status in config table, checking guardrails', ouKey);
+    const isGuardRailAttached = await isGuardRailAttachedToOu(ouKey.awsKey);
+    if (!isGuardRailAttached) {
+      console.log(
+        `Organizational Unit ${ouKey.acceleratorKey} may not be registered in Control Tower. No guardrail attached and may not be registered.`,
+      );
+      errors.push(
+        `Organizational Unit ${ouKey.acceleratorKey} may not be registered in Control Tower. No guardrail is attached and registration status is not available.`,
+      );
+    }
+  }
+  return errors;
+}
+
+async function validateAccountsInOu(
+  configTableName: string,
+  organizationalUnitKeys: ConfigOrganizationalUnitKeys[],
+): Promise<string[]> {
   const errors: string[] = [];
   let nextToken: string | undefined = undefined;
-  const organizationalUnitKeys = await getOUKeys(configTableName, commitId);
 
   const workloadAccountParams: QueryCommandInput = {
     TableName: configTableName,
@@ -419,7 +551,6 @@ async function validateAccountsInOu(configTableName: string, commitId: string): 
       });
     }
   }
-  //console.log(workloadAccountKeys);
 
   const mandatoryAccountParams: QueryCommandInput = {
     TableName: configTableName,
@@ -442,7 +573,6 @@ async function validateAccountsInOu(configTableName: string, commitId: string): 
       });
     }
   }
-  //console.log(mandatoryAccountKeys);
 
   const accountKeys = mandatoryAccountKeys;
   accountKeys.push(...workloadAccountKeys);
@@ -478,7 +608,7 @@ async function validateAccountsInOu(configTableName: string, commitId: string): 
   return errors;
 }
 
-async function getOUKeys(configTableName: string, commitId: string): Promise<OrganizationalUnitKeys[]> {
+async function getConfigOuKeys(configTableName: string, commitId: string): Promise<ConfigOrganizationalUnitKeys[]> {
   const organizationParams: QueryCommandInput = {
     TableName: configTableName,
     KeyConditionExpression: 'dataType = :hkey',
@@ -487,17 +617,46 @@ async function getOUKeys(configTableName: string, commitId: string): Promise<Org
       ':commitId': commitId,
     },
     FilterExpression: 'contains (commitId, :commitId)',
-    ProjectionExpression: 'acceleratorKey, awsKey',
+    ProjectionExpression: 'acceleratorKey, awsKey, registered, dataBag',
   };
   const organizationResponse = await throttlingBackOff(() => documentClient.send(new QueryCommand(organizationParams)));
-  const ouKeys: OrganizationalUnitKeys[] = [];
+  const ouKeys: ConfigOrganizationalUnitKeys[] = [];
   if (organizationResponse.Items) {
     for (const item of organizationResponse.Items) {
-      ouKeys.push({ acceleratorKey: item['acceleratorKey'], awsKey: item['awsKey'] });
+      const ouConfig = JSON.parse(item['dataBag']);
+      const ignored = ouConfig['ignore'] ?? false;
+      if (ignored) {
+        console.log(`Organizational Unit ${item['acceleratorKey']} is configured to be ignored`);
+      }
+      ouKeys.push({
+        acceleratorKey: item['acceleratorKey'],
+        awsKey: item['awsKey'],
+        registered: item['registered'] ?? undefined,
+        ignore: ignored,
+      });
     }
   }
-  //console.log(ouKeys);
+  //get root ou key
+  const rootId = await getRootId();
+  ouKeys.push({
+    acceleratorKey: 'Root',
+    awsKey: rootId,
+    registered: true,
+    ignore: false,
+  });
   return ouKeys;
+}
+
+async function isGuardRailAttachedToOu(ouId: string): Promise<boolean> {
+  const response = await throttlingBackOff(() =>
+    organizationsClient.listPoliciesForTarget({ TargetId: ouId, Filter: 'SERVICE_CONTROL_POLICY' }).promise(),
+  );
+  for (const policy of response.Policies ?? []) {
+    if (policy.Name?.startsWith('aws-guardrails-') && policy.AwsManaged === false) {
+      return true;
+    }
+  }
+  return false;
 }
 
 async function isStackInRollback(stackName: string): Promise<boolean> {
@@ -508,4 +667,68 @@ async function isStackInRollback(stackName: string): Promise<boolean> {
     return true;
   }
   return false;
+}
+
+async function validateAllOuInConfig(): Promise<string[]> {
+  const errors: string[] = [];
+  for (const ouKeys of awsOuKeys) {
+    if (configAllOuKeys.find(item => item.acceleratorKey === ouKeys.acceleratorKey)) {
+      continue;
+    } else {
+      errors.push(
+        `Organizational Unit '${ouKeys.acceleratorKey}' with id of '${ouKeys.awsKey}' was not found in the organization configuration.`,
+      );
+    }
+  }
+  return errors;
+}
+
+async function validateAllAwsAccountsInConfig(): Promise<string[]> {
+  const errors: string[] = [];
+  for (const account of organizationAccounts) {
+    if (workloadAccounts.find(item => item['acceleratorKey'] === account.Email!)) {
+      continue;
+    }
+    if (mandatoryAccounts.find(item => item['acceleratorKey'] === account.Email!)) {
+      continue;
+    }
+    //check if ou is ignored
+    const response = await throttlingBackOff(() => organizationsClient.listParents({ ChildId: account.Id! }).promise());
+    if (!configIgnoredOuKeys.find(item => item.awsKey === response.Parents![0].Id)) {
+      errors.push(
+        `Account with Id ${account.Id} and email ${account.Email} is not in the accounts configuration and is not a member of an ignored OU.`,
+      );
+    }
+  }
+  return errors;
+}
+
+async function getAwsOrganizationalUnitKeys(ouId: string, path: string) {
+  let nextToken: string | undefined = undefined;
+  do {
+    const page = await throttlingBackOff(() =>
+      organizationsClient.listOrganizationalUnitsForParent({ ParentId: ouId, NextToken: nextToken }).promise(),
+    );
+    for (const ou of page.OrganizationalUnits ?? []) {
+      awsOuKeys.push({ acceleratorKey: `${path}${ou.Name!}`, awsKey: ou.Id! });
+      await getAwsOrganizationalUnitKeys(ou.Id!, `${path}${ou.Name!}/`);
+    }
+    nextToken = page.NextToken;
+  } while (nextToken);
+}
+
+async function getRootId(): Promise<string> {
+  // get root ou id
+  let rootId = '';
+  let nextToken: string | undefined = undefined;
+  do {
+    const page = await throttlingBackOff(() => organizationsClient.listRoots({ NextToken: nextToken }).promise());
+    for (const item of page.Roots ?? []) {
+      if (item.Name === 'Root' && item.Id && item.Arn) {
+        rootId = item.Id;
+      }
+    }
+    nextToken = page.NextToken;
+  } while (nextToken);
+  return rootId;
 }

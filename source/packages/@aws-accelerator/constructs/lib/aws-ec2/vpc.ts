@@ -12,8 +12,13 @@
  */
 
 import * as cdk from 'aws-cdk-lib';
+import * as path from 'path';
+import { v4 as uuidv4 } from 'uuid';
 import { Construct } from 'constructs';
 
+import { IpamAllocationConfig, OutpostsConfig, VirtualPrivateGatewayConfig } from '@aws-accelerator/config';
+
+import { IpamSubnet } from './ipam-subnet';
 import { IPrefixList } from './prefix-list';
 import { IRouteTable } from './route-table';
 
@@ -50,11 +55,16 @@ export interface ISubnet extends cdk.IResource {
 export interface SubnetProps {
   readonly name: string;
   readonly availabilityZone: string;
-  readonly ipv4CidrBlock: string;
   readonly mapPublicIpOnLaunch?: boolean;
   readonly routeTable: IRouteTable;
   readonly vpc: IVpc;
+  readonly basePool?: string[];
+  readonly ipamAllocation?: IpamAllocationConfig;
+  readonly ipv4CidrBlock?: string;
+  readonly kmsKey?: cdk.aws_kms.Key;
+  readonly logRetentionInDays?: number;
   readonly tags?: cdk.CfnTag[];
+  readonly outpost?: OutpostsConfig;
   // readonly nacl: INacl;
 }
 
@@ -66,35 +76,83 @@ export class Subnet extends cdk.Resource implements ISubnet {
   public readonly routeTable: IRouteTable;
   public readonly subnetId: string;
   public readonly subnetArn: string;
+  public readonly outpostArn?: string;
 
   constructor(scope: Construct, id: string, props: SubnetProps) {
     super(scope, id);
 
     this.subnetName = props.name;
     this.availabilityZone = props.availabilityZone;
-    this.ipv4CidrBlock = props.ipv4CidrBlock;
     this.mapPublicIpOnLaunch = props.mapPublicIpOnLaunch;
     this.routeTable = props.routeTable;
+    this.outpostArn = props.outpost?.arn;
+    // Determine if IPAM subnet or native
+    let resource: cdk.aws_ec2.CfnSubnet | IpamSubnet;
 
-    //props.tags?.push({ key: 'Name', value: props.name });
+    if (props.ipv4CidrBlock) {
+      this.ipv4CidrBlock = props.ipv4CidrBlock;
 
-    const resource = new cdk.aws_ec2.CfnSubnet(this, 'Resource', {
-      vpcId: props.vpc.vpcId,
-      cidrBlock: props.ipv4CidrBlock,
-      availabilityZone: props.availabilityZone,
-      mapPublicIpOnLaunch: props.mapPublicIpOnLaunch,
-      tags: props.tags,
-    });
+      resource = new cdk.aws_ec2.CfnSubnet(this, 'Resource', {
+        vpcId: props.vpc.vpcId,
+        cidrBlock: props.ipv4CidrBlock,
+        availabilityZone: props.availabilityZone,
+        mapPublicIpOnLaunch: props.mapPublicIpOnLaunch,
+        tags: props.tags,
+        outpostArn: props.outpost?.arn,
+      });
 
-    cdk.Tags.of(this).add('Name', props.name);
+      cdk.Tags.of(this).add('Name', props.name);
+      this.subnetId = resource.ref;
+      this.subnetArn = cdk.Stack.of(this).formatArn({
+        service: 'ec2',
+        resource: 'subnet',
+        arnFormat: cdk.ArnFormat.SLASH_RESOURCE_NAME,
+        resourceName: resource.ref,
+      });
+    } else {
+      if (!props.basePool) {
+        throw new Error(
+          `Error creating subnet ${props.name}: must specify basePool property when using ipamAllocation`,
+        );
+      }
+      if (!props.ipamAllocation) {
+        throw new Error(
+          `Error creating subnet ${props.name}: ipamAllocation property must be defined if not specifying ipv4CidrBlock`,
+        );
+      }
+      if (!props.logRetentionInDays) {
+        throw new Error(
+          `Error creating subnet ${props.name}: logRetentionInDays property must be defined if not specifying ipv4CidrBlock`,
+        );
+      }
+      if (!props.kmsKey) {
+        throw new Error(
+          `Error creating subnet ${props.name}: kmsKey property must be defined if not specifying ipv4CidrBlock`,
+        );
+      }
 
-    this.subnetId = resource.ref;
-    this.subnetArn = cdk.Stack.of(this).formatArn({
-      service: 'ec2',
-      resource: 'subnet',
-      arnFormat: cdk.ArnFormat.SLASH_RESOURCE_NAME,
-      resourceName: resource.ref,
-    });
+      resource = new IpamSubnet(this, 'Resource', {
+        name: props.name,
+        availabilityZone: props.availabilityZone,
+        basePool: props.basePool,
+        ipamAllocation: props.ipamAllocation,
+        vpcId: props.vpc.vpcId,
+        mapPublicIpOnLaunch: props.mapPublicIpOnLaunch,
+        kmsKey: props.kmsKey,
+        logRetentionInDays: props.logRetentionInDays,
+        tags: props.tags,
+        outpostArn: props.outpost?.arn,
+      });
+
+      this.ipv4CidrBlock = resource.ipv4CidrBlock;
+      this.subnetId = resource.subnetId;
+      this.subnetArn = cdk.Stack.of(this).formatArn({
+        service: 'ec2',
+        resource: 'subnet',
+        arnFormat: cdk.ArnFormat.SLASH_RESOURCE_NAME,
+        resourceName: resource.subnetId,
+      });
+    }
 
     new cdk.aws_ec2.CfnSubnetRouteTableAssociation(this, 'RouteTableAssociation', {
       subnetId: this.subnetId,
@@ -122,31 +180,46 @@ export interface INatGateway extends cdk.IResource {
 export interface NatGatewayProps {
   readonly name: string;
   readonly subnet: ISubnet;
+  readonly allocationId?: string;
+  readonly private?: boolean;
   readonly tags?: cdk.CfnTag[];
 }
 
 export class NatGateway extends cdk.Resource implements INatGateway {
   public readonly natGatewayId: string;
   public readonly natGatewayName: string;
+  private natGatewayArgs?: cdk.aws_ec2.CfnNatGatewayProps;
 
   constructor(scope: Construct, id: string, props: NatGatewayProps) {
     super(scope, id);
 
     this.natGatewayName = props.name;
 
-    const resource = new cdk.aws_ec2.CfnNatGateway(this, 'Resource', {
+    this.natGatewayArgs = {
       subnetId: props.subnet.subnetId,
-      allocationId: new cdk.aws_ec2.CfnEIP(this, 'Eip', {
-        domain: 'vpc',
-      }).attrAllocationId,
+      allocationId: props.private ? undefined : this.getAllocationId(props),
+      connectivityType: props.private ? 'private' : undefined,
       tags: props.tags,
-    });
-    cdk.Tags.of(this).add('Name', props.name);
+    };
 
+    const resource = new cdk.aws_ec2.CfnNatGateway(this, 'Resource', this.natGatewayArgs);
+    cdk.Tags.of(this).add('Name', props.name);
     this.natGatewayId = resource.ref;
   }
-}
 
+  /**
+   * Return allocation ID for a public NAT gateway
+   * @param props
+   * @returns
+   */
+  private getAllocationId(props: NatGatewayProps): string {
+    return props.allocationId
+      ? props.allocationId
+      : new cdk.aws_ec2.CfnEIP(this, 'Eip', {
+          domain: 'vpc',
+        }).attrAllocationId;
+  }
+}
 export interface ISecurityGroup extends cdk.IResource {
   /**
    * ID for the current security group
@@ -419,38 +492,48 @@ export interface IVpc extends cdk.IResource {
  */
 export interface VpcProps {
   readonly name: string;
-  readonly ipv4CidrBlock: string;
   readonly dhcpOptions?: string;
   readonly enableDnsHostnames?: boolean;
   readonly enableDnsSupport?: boolean;
   readonly instanceTenancy?: 'default' | 'dedicated';
   readonly internetGateway?: boolean;
+  readonly ipv4CidrBlock?: string;
+  readonly ipv4IpamPoolId?: string;
+  readonly ipv4NetmaskLength?: number;
   readonly tags?: cdk.CfnTag[];
+  readonly virtualPrivateGateway?: VirtualPrivateGatewayConfig;
 }
 
 /**
  * Defines a  VPC object
  */
 export class Vpc extends cdk.Resource implements IVpc {
+  public readonly name: string;
   public readonly vpcId: string;
+  public readonly cidrs: cdk.aws_ec2.CfnVPCCidrBlock[];
   public readonly internetGateway: cdk.aws_ec2.CfnInternetGateway | undefined;
   public readonly internetGatewayAttachment: cdk.aws_ec2.CfnVPCGatewayAttachment | undefined;
   public readonly dhcpOptionsAssociation: cdk.aws_ec2.CfnVPCDHCPOptionsAssociation | undefined;
+  public readonly virtualPrivateGateway: cdk.aws_ec2.VpnGateway | undefined;
+  public readonly virtualPrivateGatewayAttachment: cdk.aws_ec2.CfnVPCGatewayAttachment | undefined;
 
   constructor(scope: Construct, id: string, props: VpcProps) {
     super(scope, id);
+    this.name = props.name;
 
     const resource = new cdk.aws_ec2.CfnVPC(this, 'Resource', {
       cidrBlock: props.ipv4CidrBlock,
       enableDnsHostnames: props.enableDnsHostnames,
       enableDnsSupport: props.enableDnsSupport,
       instanceTenancy: props.instanceTenancy,
+      ipv4IpamPoolId: props.ipv4IpamPoolId,
+      ipv4NetmaskLength: props.ipv4NetmaskLength,
       tags: props.tags,
     });
     cdk.Tags.of(this).add('Name', props.name);
 
     this.vpcId = resource.ref;
-
+    this.cidrs = [];
     if (props.internetGateway) {
       this.internetGateway = new cdk.aws_ec2.CfnInternetGateway(this, 'InternetGateway', {});
 
@@ -458,6 +541,22 @@ export class Vpc extends cdk.Resource implements IVpc {
         internetGatewayId: this.internetGateway.ref,
         vpcId: this.vpcId,
       });
+    }
+
+    if (props.virtualPrivateGateway) {
+      this.virtualPrivateGateway = new cdk.aws_ec2.VpnGateway(this, `VirtualPrivateGateway`, {
+        amazonSideAsn: props.virtualPrivateGateway.asn,
+        type: 'ipsec.1',
+      });
+
+      this.virtualPrivateGatewayAttachment = new cdk.aws_ec2.CfnVPCGatewayAttachment(
+        this,
+        `VirtualPrivateGatewayAttachment`,
+        {
+          vpnGatewayId: this.virtualPrivateGateway.gatewayId,
+          vpcId: this.vpcId,
+        },
+      );
     }
 
     if (props.dhcpOptions) {
@@ -474,7 +573,7 @@ export class Vpc extends cdk.Resource implements IVpc {
     maxAggregationInterval: number;
     logFormat?: string;
     logRetentionInDays?: number;
-    encryptionKey?: cdk.aws_kms.IKey | undefined;
+    encryptionKey?: cdk.aws_kms.IKey;
     bucketArn?: string;
   }) {
     // Validate maxAggregationInterval
@@ -518,7 +617,7 @@ export class Vpc extends cdk.Resource implements IVpc {
       );
 
       new cdk.aws_ec2.CfnFlowLog(this, 'CloudWatchFlowLog', {
-        deliverLogsPermissionArn: role.roleArn, // import * as logs from 'aws-cdk-lib/aws-logs';
+        deliverLogsPermissionArn: role.roleArn,
         logDestinationType: 'cloud-watch-logs',
         logDestination: logGroup.logGroupArn,
         resourceId: this.vpcId,
@@ -533,7 +632,7 @@ export class Vpc extends cdk.Resource implements IVpc {
     if (options.destinations.includes('s3')) {
       new cdk.aws_ec2.CfnFlowLog(this, 'S3FlowLog', {
         logDestinationType: 's3',
-        logDestination: options.bucketArn,
+        logDestination: `${options.bucketArn}/vpc-flow-logs/`,
         resourceId: this.vpcId,
         resourceType: 'VPC',
         trafficType: options.trafficType,
@@ -541,5 +640,109 @@ export class Vpc extends cdk.Resource implements IVpc {
         logFormat: options.logFormat,
       });
     }
+  }
+
+  public addCidr(options: {
+    amazonProvidedIpv6CidrBlock?: boolean;
+    cidrBlock?: string;
+    ipv4IpamPoolId?: string;
+    ipv4NetmaskLength?: number;
+    ipv6CidrBlock?: string;
+    ipv6IpamPoolId?: string;
+    ipv6NetmaskLength?: number;
+    ipv6Pool?: string;
+  }) {
+    // This block is required for backwards compatibility
+    // with a previous iteration. It appends a number to the
+    // logical ID so more than two VPC CIDRs can be defined.
+    let logicalId = 'VpcCidrBlock';
+    if (this.cidrs.length > 0) {
+      logicalId = `VpcCidrBlock${this.cidrs.length}`;
+    }
+
+    // Create a secondary VPC CIDR
+    this.cidrs.push(
+      new cdk.aws_ec2.CfnVPCCidrBlock(this, logicalId, {
+        amazonProvidedIpv6CidrBlock: options.amazonProvidedIpv6CidrBlock,
+        cidrBlock: options.cidrBlock,
+        ipv4IpamPoolId: options.ipv4IpamPoolId,
+        ipv4NetmaskLength: options.ipv4NetmaskLength,
+        ipv6CidrBlock: options.ipv6CidrBlock,
+        ipv6IpamPoolId: options.ipv6IpamPoolId,
+        ipv6Pool: options.ipv6Pool,
+        vpcId: this.vpcId,
+      }),
+    );
+  }
+}
+
+/**
+ * Initialized DeleteDefaultSecurityGroupRules properties
+ */
+export interface DeleteDefaultSecurityGroupRulesProps {
+  /**
+   * Take in Vpc Id as a parameter
+   */
+  readonly vpcId: string;
+
+  /**
+   * Custom resource lambda log group encryption key
+   */
+  readonly kmsKey: cdk.aws_kms.Key;
+  /**
+   * Custom resource lambda log retention in days
+   */
+  readonly logRetentionInDays: number;
+}
+/**
+ * Class Delete the Default Security Group Rules for the Vpc
+ */
+export class DeleteDefaultSecurityGroupRules extends Construct {
+  readonly id: string;
+  constructor(scope: Construct, id: string, props: DeleteDefaultSecurityGroupRulesProps) {
+    super(scope, id);
+
+    const DELETE_DEFAULT_SECURITY_GROUP_RULES = 'Custom::DeleteDefaultSecurityGroupRules';
+
+    //
+    // Function definition for the custom resource
+    //
+    const provider = cdk.CustomResourceProvider.getOrCreateProvider(this, DELETE_DEFAULT_SECURITY_GROUP_RULES, {
+      codeDirectory: path.join(__dirname, 'delete-default-security-group-rules/dist'),
+      runtime: cdk.CustomResourceProviderRuntime.NODEJS_14_X,
+      policyStatements: [
+        {
+          Effect: 'Allow',
+          Action: ['ec2:DescribeSecurityGroups', 'ec2:RevokeSecurityGroupIngress', 'ec2:RevokeSecurityGroupEgress'],
+          Resource: '*',
+        },
+      ],
+    });
+
+    const resource = new cdk.CustomResource(this, 'Resource', {
+      resourceType: DELETE_DEFAULT_SECURITY_GROUP_RULES,
+      serviceToken: provider.serviceToken,
+      properties: {
+        vpcId: props.vpcId,
+        uuid: uuidv4(), // Generates a new UUID to force the resource to update
+      },
+    });
+
+    /**
+     * Singleton pattern to define the log group for the singleton function
+     * in the stack
+     */
+    const stack = cdk.Stack.of(scope);
+    const logGroup =
+      (stack.node.tryFindChild(`${provider.node.id}LogGroup`) as cdk.aws_logs.LogGroup) ??
+      new cdk.aws_logs.LogGroup(stack, `${provider.node.id}LogGroup`, {
+        logGroupName: `/aws/lambda/${(provider.node.findChild('Handler') as cdk.aws_lambda.CfnFunction).ref}`,
+        retention: props.logRetentionInDays,
+        encryptionKey: props.kmsKey,
+        removalPolicy: cdk.RemovalPolicy.DESTROY,
+      });
+    resource.node.addDependency(logGroup);
+
+    this.id = resource.ref;
   }
 }

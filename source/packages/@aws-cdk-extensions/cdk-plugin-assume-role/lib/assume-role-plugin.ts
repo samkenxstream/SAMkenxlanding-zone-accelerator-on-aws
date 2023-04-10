@@ -11,8 +11,9 @@
  *  and limitations under the License.
  */
 
-import { Plugin, PluginHost } from 'aws-cdk/lib/plugin';
+import { Plugin, PluginHost } from 'aws-cdk/lib/api/plugin';
 import * as AWS from 'aws-sdk';
+
 import { AssumeRoleProviderSource } from './assume-role-provider-source';
 
 export class AssumeProfilePlugin implements Plugin {
@@ -20,10 +21,12 @@ export class AssumeProfilePlugin implements Plugin {
 
   constructor(
     private readonly props: {
+      region?: string;
       assumeRoleName?: string;
       assumeRoleDuration?: number;
       credentials?: AWS.STS.Credentials;
       partition?: string;
+      caBundlePath?: string;
     } = {},
   ) {}
 
@@ -32,8 +35,10 @@ export class AssumeProfilePlugin implements Plugin {
       name: 'cdk-assume-role-plugin',
       assumeRoleName: this.props.assumeRoleName ?? AssumeProfilePlugin.getDefaultAssumeRoleName(),
       assumeRoleDuration: this.props.assumeRoleDuration ?? AssumeProfilePlugin.getDefaultAssumeRoleDuration(),
+      region: this.props.region!,
       credentials: this.props.credentials,
       partition: this.props.partition,
+      caBundlePath: this.props.caBundlePath,
     });
     host.registerCredentialProviderSource(source);
   }

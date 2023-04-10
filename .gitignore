@@ -1,13 +1,16 @@
 *.js
 !deployment/.typescript/cdk-solution-helper/index.js
+!**/create-govcloud-account/index.js
 package-lock.json
 !jest.config.js
+!setEnvVars.js
 *.d.ts
 *.tsbuildinfo
 node_modules
 dist
 !source/.typescript/lambda/**/*.js
 !source/lambda/**/*.js
+source/packages/@aws-accelerator/accelerator/lib/logger.js.map
 
 ### log files
 *.log
@@ -17,6 +20,7 @@ dist
 cdk.out
 
 !**/cdk-solution-helper/index.js
+!**/update-pipeline-github-token/index.js
 
 deployment/global-s3-assets
 deployment/regional-s3-assets
@@ -40,6 +44,7 @@ coverage/
 
 ### IntelliJ ###
 .idea
+*.iml
 
 ### Exclude Documentation ###
 docs
@@ -56,4 +61,10 @@ development
 .vscode
 
 ### Viperlight
-viperlight.zip
+viperlight*.zip
+
+
+### Sonarqube
+.scannerwork
+
+*.js.map

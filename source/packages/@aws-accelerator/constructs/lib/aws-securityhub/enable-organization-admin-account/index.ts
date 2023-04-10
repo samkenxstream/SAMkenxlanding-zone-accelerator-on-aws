@@ -11,7 +11,7 @@
  *  and limitations under the License.
  */
 
-import { throttlingBackOff } from '@aws-accelerator/utils';
+import { delay, throttlingBackOff } from '@aws-accelerator/utils';
 import * as AWS from 'aws-sdk';
 AWS.config.logger = console;
 
@@ -31,14 +31,17 @@ export async function handler(event: AWSLambda.CloudFormationCustomResourceEvent
   const region = event.ResourceProperties['region'];
   const partition = event.ResourceProperties['partition'];
   const adminAccountId = event.ResourceProperties['adminAccountId'];
+  const solutionId = process.env['SOLUTION_ID'];
 
   let organizationsClient: AWS.Organizations;
   if (partition === 'aws-us-gov') {
-    organizationsClient = new AWS.Organizations({ region: 'us-gov-west-1' });
+    organizationsClient = new AWS.Organizations({ region: 'us-gov-west-1', customUserAgent: solutionId });
+  } else if (partition === 'aws-cn') {
+    organizationsClient = new AWS.Organizations({ region: 'cn-northwest-1', customUserAgent: solutionId });
   } else {
-    organizationsClient = new AWS.Organizations({ region: 'us-east-1' });
+    organizationsClient = new AWS.Organizations({ region: 'us-east-1', customUserAgent: solutionId });
   }
-  const securityHubClient = new AWS.SecurityHub({ region: region });
+  const securityHubClient = new AWS.SecurityHub({ region: region, customUserAgent: solutionId });
 
   const securityHubAdminAccount = await getSecurityHubDelegatedAccount(securityHubClient, adminAccountId);
 
@@ -62,9 +65,19 @@ export async function handler(event: AWSLambda.CloudFormationCustomResourceEvent
         console.log(
           `Started enableOrganizationAdminAccount function in ${event.ResourceProperties['region']} region for account ${adminAccountId}`,
         );
-        await throttlingBackOff(() =>
-          securityHubClient.enableOrganizationAdminAccount({ AdminAccountId: adminAccountId }).promise(),
-        );
+        let retries = 0;
+        while (retries < 10) {
+          await delay(retries ** 2 * 1000);
+          try {
+            await throttlingBackOff(() =>
+              securityHubClient.enableOrganizationAdminAccount({ AdminAccountId: adminAccountId }).promise(),
+            );
+            break;
+          } catch (error) {
+            console.log(error);
+            retries = retries + 1;
+          }
+        }
       }
 
       return { Status: 'Success', StatusCode: 200 };

@@ -21,8 +21,8 @@ import {
   paginateQuery,
   DynamoDBDocumentPaginationConfiguration,
 } from '@aws-sdk/lib-dynamodb';
-AWS.config.logger = console;
 
+AWS.config.logger = console;
 let organizationsClient: AWS.Organizations;
 const marshallOptions = {
   convertEmptyValues: false,
@@ -34,19 +34,18 @@ const unmarshallOptions = {
   wrapNumbers: false,
 };
 const translateConfig = { marshallOptions, unmarshallOptions };
-const dynamodbClient1 = new DynamoDBClient({});
-const documentClient = DynamoDBDocumentClient.from(dynamodbClient1, translateConfig);
-const paginationConfig: DynamoDBDocumentPaginationConfiguration = {
-  client: documentClient,
-  pageSize: 100,
-};
+let paginationConfig: DynamoDBDocumentPaginationConfiguration;
+let dynamodbClient: DynamoDBClient;
+let documentClient: DynamoDBDocumentClient;
 
-type DDBItem = {
-  // eslint-disable-next-line @typescript-eslint/no-explicit-any
-  [key: string]: any;
+type OrganizationConfigRecord = {
+  dataType: string;
+  acceleratorKey: string;
+  dataBag: string;
+  awsKey: string;
+  commitId: string;
 };
-type DDBItems = Array<DDBItem>;
-
+type OrganizationConfigRecords = Array<OrganizationConfigRecord>;
 /**
  * create-organizational-units - lambda handler
  *
@@ -64,47 +63,52 @@ export async function handler(event: AWSLambda.CloudFormationCustomResourceEvent
   const controlTowerEnabled = event.ResourceProperties['controlTowerEnabled'];
   const organizationsEnabled = event.ResourceProperties['organizationsEnabled'];
   const partition = event.ResourceProperties['partition'];
+  const organizationalUnitsToCreate: OrganizationConfigRecords = [];
+  const solutionId = process.env['SOLUTION_ID'];
 
-  const organizationalUnitsToCreate: AWS.DynamoDB.DocumentClient.AttributeMap = [];
+  dynamodbClient = new DynamoDBClient({ customUserAgent: solutionId });
+  documentClient = DynamoDBDocumentClient.from(dynamodbClient, translateConfig);
+  paginationConfig = {
+    client: documentClient,
+    pageSize: 100,
+  };
 
   switch (event.RequestType) {
     case 'Create':
     case 'Update':
       if (organizationsEnabled == 'false' || controlTowerEnabled == 'true') {
+        console.log('Stopping, either Organizations not enabled or ControlTower is enabled.');
         return {
           Status: 'SUCCESS',
         };
       }
       if (partition === 'aws-us-gov') {
         organizationsClient = new AWS.Organizations({ region: 'us-gov-west-1' });
+      } else if (partition === 'aws-cn') {
+        organizationsClient = new AWS.Organizations({ region: 'cn-northwest-1' });
       } else {
         organizationsClient = new AWS.Organizations({ region: 'us-east-1' });
       }
-
       //read config from table
       const organizationalUnitList = await getConfigFromTable(configTableName, commitId);
       console.log(`Organizational Units retrieved from config table: ${JSON.stringify(organizationalUnitList)}`);
-
       //build list of organizational units that need to be created
       if (organizationalUnitList) {
         for (const organizationalUnit of organizationalUnitList) {
-          if (!organizationalUnit['awsKey']) {
-            organizationalUnitsToCreate['push'](organizationalUnit);
+          if (!organizationalUnit.awsKey) {
+            organizationalUnitsToCreate.push(organizationalUnit);
           }
         }
       }
-
       //get organzational root id
       const rootId = await getRootId();
       console.log(`Root OU ID ${rootId}`);
-
       //sort by number of elements in order to
       //create parent organizational units first
-      const sortedOrganizationalUnits = organizationalUnitsToCreate['sort']((a, b) =>
+      const sortedOrganizationalUnits = organizationalUnitsToCreate.sort((a, b) =>
         a['acceleratorKey'].split('/').length > b['acceleratorKey'].split('/').length ? 1 : -1,
       );
-
-      console.log(`Sorted list of OU's to create ${sortedOrganizationalUnits}`);
+      console.log(`Sorted list of OU's to create ${JSON.stringify(sortedOrganizationalUnits)}`);
       for (const organizationalUnit of sortedOrganizationalUnits) {
         console.log(`Creating organizational unit ${organizationalUnit['acceleratorKey']}`);
         const createResponse = await createOrganizationalUnitFromPath(
@@ -121,7 +125,6 @@ export async function handler(event: AWSLambda.CloudFormationCustomResourceEvent
       return {
         Status: 'SUCCESS',
       };
-
     case 'Delete':
       // Do Nothing
       return {
@@ -129,7 +132,6 @@ export async function handler(event: AWSLambda.CloudFormationCustomResourceEvent
       };
   }
 }
-
 async function lookupOrganizationalUnit(name: string, parentId: string): Promise<string> {
   let nextToken: string | undefined = undefined;
   const page = await throttlingBackOff(() =>
@@ -144,29 +146,26 @@ async function lookupOrganizationalUnit(name: string, parentId: string): Promise
   while (nextToken);
   return '';
 }
-
-async function getConfigFromTable(configTableName: string, commitId: string): Promise<DDBItems> {
+async function getConfigFromTable(configTableName: string, commitId: string): Promise<OrganizationConfigRecords> {
   const params = {
     TableName: configTableName,
     KeyConditionExpression: 'dataType = :hkey',
     ExpressionAttributeValues: {
       ':hkey': 'organization',
-      ':commitId': commitId,
     },
-    FilterExpression: 'contains (commitId, :commitId)',
   };
-  const items: DDBItems = [];
+  const items: OrganizationConfigRecords = [];
   const paginator = paginateQuery(paginationConfig, params);
   for await (const page of paginator) {
     if (page.Items) {
       for (const item of page.Items) {
-        items.push(item);
+        items.push(item as OrganizationConfigRecord);
       }
     }
   }
-  return items;
+  const filterCommitIdResults = items.filter(item => item.commitId == commitId);
+  return filterCommitIdResults;
 }
-
 async function getRootId(): Promise<string> {
   // get root ou id
   let rootId = '';
@@ -182,7 +181,6 @@ async function getRootId(): Promise<string> {
   } while (nextToken);
   return rootId;
 }
-
 function getPath(name: string): string {
   //get the parent path
   const pathIndex = name.lastIndexOf('/');
@@ -192,7 +190,6 @@ function getPath(name: string): string {
   }
   return '/' + path;
 }
-
 function getOuName(name: string): string {
   const result = name.split('/').pop();
   if (result === undefined) {
@@ -200,14 +197,12 @@ function getOuName(name: string): string {
   }
   return result;
 }
-
 async function createOrganizationalUnitFromPath(
   rootId: string,
   acceleratorKey: string,
   configTableName: string,
 ): Promise<boolean> {
   let parentId = rootId;
-
   const path = getPath(acceleratorKey);
   const name = getOuName(acceleratorKey);
   //find parent for ou
@@ -223,7 +218,6 @@ async function createOrganizationalUnitFromPath(
       }
     }
   }
-
   // Create the OU if not found
   try {
     const organizationsResponse = await throttlingBackOff(() =>

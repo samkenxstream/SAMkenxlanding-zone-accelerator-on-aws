@@ -20,8 +20,8 @@ import { TransitGatewayAttachmentOptionsConfig } from '@aws-accelerator/config';
 const path = require('path');
 
 export interface ITransitGatewayRouteTableAssociation extends cdk.IResource {
-  readonly transitGatewayAttachmentId: string; // TODO: change to ITransitGatewayAttachment
-  readonly transitGatewayRouteTableId: string; // TODO: change to ITransitGatewayRouteTable
+  readonly transitGatewayAttachmentId: string;
+  readonly transitGatewayRouteTableId: string;
 }
 
 export interface TransitGatewayRouteTableAssociationProps {
@@ -47,8 +47,8 @@ export class TransitGatewayRouteTableAssociation extends cdk.Resource implements
 }
 
 export interface ITransitGatewayRouteTablePropagation extends cdk.IResource {
-  readonly transitGatewayAttachmentId: string; // TODO: change to ITransitGatewayAttachment
-  readonly transitGatewayRouteTableId: string; // TODO: change to ITransitGatewayRouteTable
+  readonly transitGatewayAttachmentId: string;
+  readonly transitGatewayRouteTableId: string;
 }
 
 export interface TransitGatewayRouteTablePropagationProps {
@@ -88,10 +88,18 @@ export interface TransitGatewayAttachmentProps {
   readonly tags?: cdk.CfnTag[];
 }
 
+export enum TransitGatewayAttachmentType {
+  DXGW = 'direct-connect-gateway',
+  PEERING = 'peering',
+  VPC = 'vpc',
+  VPN = 'vpn',
+}
+
 export interface TransitGatewayAttachmentLookupOptions {
   readonly name: string;
   readonly owningAccountId: string;
-  readonly transitGatewayId: string; // TODO: change to ITransitGateway
+  readonly transitGatewayId: string;
+  readonly type: TransitGatewayAttachmentType;
   readonly roleName?: string;
   /**
    * Custom resource lambda log group encryption key
@@ -127,23 +135,36 @@ export class TransitGatewayAttachment extends cdk.Resource implements ITransitGa
               Action: ['sts:AssumeRole'],
               Resource: '*',
             },
+            {
+              Effect: 'Allow',
+              Action: ['ec2:DescribeTransitGatewayAttachments', 'ec2:DescribeVpnConnections'],
+              Resource: '*',
+            },
           ],
         });
+
+        // Construct role arn if this is a cross-account lookup
+        let roleArn: string | undefined = undefined;
+        if (options.roleName) {
+          roleArn = cdk.Stack.of(this).formatArn({
+            service: 'iam',
+            region: '',
+            account: options.owningAccountId,
+            resource: 'role',
+            arnFormat: cdk.ArnFormat.SLASH_RESOURCE_NAME,
+            resourceName: options.roleName,
+          });
+        }
 
         const resource = new cdk.CustomResource(this, 'Resource', {
           resourceType: GET_TRANSIT_GATEWAY_ATTACHMENT,
           serviceToken: provider.serviceToken,
           properties: {
+            region: cdk.Stack.of(this).region,
             name: options.name,
             transitGatewayId: options.transitGatewayId,
-            roleArn: cdk.Stack.of(this).formatArn({
-              service: 'iam',
-              region: '',
-              account: options.owningAccountId,
-              resource: 'role',
-              arnFormat: cdk.ArnFormat.SLASH_RESOURCE_NAME,
-              resourceName: options.roleName,
-            }),
+            type: options.type,
+            roleArn,
             uuid: uuidv4(), // Generates a new UUID to force the resource to update
           },
         });
@@ -176,25 +197,41 @@ export class TransitGatewayAttachment extends cdk.Resource implements ITransitGa
     super(scope, id);
 
     let resource: cdk.aws_ec2.CfnTransitGatewayVpcAttachment | cdk.aws_ec2.CfnTransitGatewayAttachment;
-    if (props.partition === 'aws') {
-      resource = new cdk.aws_ec2.CfnTransitGatewayVpcAttachment(this, 'Resource', {
-        vpcId: props.vpcId,
-        transitGatewayId: props.transitGatewayId,
-        subnetIds: props.subnetIds,
-        options: {
-          ApplianceModeSupport: props.options?.applianceModeSupport ?? 'disable',
-          DnsSupport: props.options?.dnsSupport ?? 'enable',
-          Ipv6Support: props.options?.ipv6Support ?? 'disable',
-        },
-        tags: props.tags,
-      });
-    } else {
-      resource = new cdk.aws_ec2.CfnTransitGatewayAttachment(this, 'Resource', {
-        vpcId: props.vpcId,
-        transitGatewayId: props.transitGatewayId,
-        subnetIds: props.subnetIds,
-        tags: props.tags,
-      });
+    switch (props.partition) {
+      case 'aws':
+        resource = new cdk.aws_ec2.CfnTransitGatewayVpcAttachment(this, 'Resource', {
+          vpcId: props.vpcId,
+          transitGatewayId: props.transitGatewayId,
+          subnetIds: props.subnetIds,
+          options: {
+            ApplianceModeSupport: props.options?.applianceModeSupport ?? 'disable',
+            DnsSupport: props.options?.dnsSupport ?? 'enable',
+            Ipv6Support: props.options?.ipv6Support ?? 'disable',
+          },
+          tags: props.tags,
+        });
+        break;
+      case 'aws-us-gov':
+        resource = new cdk.aws_ec2.CfnTransitGatewayAttachment(this, 'Resource', {
+          vpcId: props.vpcId,
+          transitGatewayId: props.transitGatewayId,
+          subnetIds: props.subnetIds,
+          options: {
+            ApplianceModeSupport: props.options?.applianceModeSupport ?? 'disable',
+            DnsSupport: props.options?.dnsSupport ?? 'enable',
+            Ipv6Support: props.options?.ipv6Support ?? 'disable',
+          },
+          tags: props.tags,
+        });
+        break;
+      default:
+        resource = new cdk.aws_ec2.CfnTransitGatewayAttachment(this, 'Resource', {
+          vpcId: props.vpcId,
+          transitGatewayId: props.transitGatewayId,
+          subnetIds: props.subnetIds,
+          tags: props.tags,
+        });
+        break;
     }
     // Add name tag
     cdk.Tags.of(this).add('Name', props.name);

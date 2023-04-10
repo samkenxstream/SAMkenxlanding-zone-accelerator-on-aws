@@ -30,13 +30,17 @@ export interface SsmParameterLookupProps {
    */
   readonly accountId: string;
   /**
+   * Parameter region
+   */
+  readonly parameterRegion: string;
+  /**
    * The name of the cross account role to use when accessing
    */
-  readonly roleName: string;
+  readonly roleName?: string;
   /**
    * Custom resource lambda log group encryption key
    */
-  readonly kmsKey?: cdk.aws_kms.Key;
+  readonly kmsKey?: cdk.aws_kms.IKey;
   /**
    * Custom resource lambda log retention in days
    */
@@ -54,8 +58,6 @@ export class SsmParameterLookup extends Construct {
 
     const RESOURCE_TYPE = 'Custom::SsmGetParameterValue';
 
-    const roleArn = `arn:${cdk.Stack.of(this).partition}:iam::${props.accountId}:role/${props.roleName}`;
-
     const provider = cdk.CustomResourceProvider.getOrCreateProvider(this, RESOURCE_TYPE, {
       codeDirectory: path.join(__dirname, 'get-param-value/dist'),
       runtime: cdk.CustomResourceProviderRuntime.NODEJS_14_X,
@@ -70,16 +72,21 @@ export class SsmParameterLookup extends Construct {
           Sid: 'StsAssumeRoleActions',
           Effect: cdk.aws_iam.Effect.ALLOW,
           Action: ['sts:AssumeRole'],
-          Resource: [roleArn],
+          Resource: [`arn:${cdk.Stack.of(this).partition}:iam::*:role/AWSAccelerator*`],
         },
       ],
     });
+
+    const roleArn = props.roleName
+      ? `arn:${cdk.Stack.of(this).partition}:iam::${props.accountId}:role/${props.roleName}`
+      : '';
 
     const resource = new cdk.CustomResource(this, 'Resource', {
       resourceType: RESOURCE_TYPE,
       serviceToken: provider.serviceToken,
       properties: {
-        region: cdk.Stack.of(this).region,
+        parameterRegion: props.parameterRegion,
+        invokingRegion: cdk.Stack.of(this).region,
         parameterAccountID: props.accountId,
         parameterName: props.name,
         assumeRoleArn: roleArn,

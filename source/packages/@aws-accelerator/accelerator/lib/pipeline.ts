@@ -24,6 +24,7 @@ import { Bucket, BucketEncryptionType } from '@aws-accelerator/constructs';
 import { AcceleratorStage } from './accelerator-stage';
 import * as config_repository from './config-repository';
 import { AcceleratorToolkitCommand } from './toolkit';
+import { Repository } from '@aws-cdk-extensions/cdk-extensions';
 
 /**
  *
@@ -41,12 +42,21 @@ export interface AcceleratorPipelineProps {
   readonly managementAccountEmail: string;
   readonly logArchiveAccountEmail: string;
   readonly auditAccountEmail: string;
+  readonly controlTowerEnabled: string;
   /**
    * List of email addresses to be notified when pipeline is waiting for manual approval stage.
    * If pipeline do not have approval stage enabled, this value will have no impact.
    */
   readonly approvalStageNotifyEmailList?: string;
   readonly partition: string;
+  /**
+   * User defined pre-existing config repository name
+   */
+  readonly configRepositoryName: string;
+  /**
+   * User defined pre-existing config repository branch name
+   */
+  readonly configRepositoryBranchName: string;
 }
 
 /**
@@ -59,59 +69,92 @@ export class AcceleratorPipeline extends Construct {
   private readonly acceleratorRepoArtifact: codepipeline.Artifact;
   private readonly configRepoArtifact: codepipeline.Artifact;
 
+  private readonly pipeline: codepipeline.Pipeline;
+  private readonly props: AcceleratorPipelineProps;
+  private readonly installerKey: cdk.aws_kms.Key;
+
   constructor(scope: Construct, id: string, props: AcceleratorPipelineProps) {
     super(scope, id);
 
+    this.props = props;
+
+    //
+    // Fields can be changed based on qualifier property
+    let acceleratorKeyArnSsmParameterName = '/accelerator/installer/kms/key-arn';
+    let secureBucketName = `aws-accelerator-pipeline-${cdk.Stack.of(this).account}-${cdk.Stack.of(this).region}`;
+    let serverAccessLogsBucketName = '/accelerator/installer-access-logs-bucket-name';
+    let configRepositoryName = 'aws-accelerator-config';
+    let pipelineName = 'AWSAccelerator-Pipeline';
+    let buildProjectName = 'AWSAccelerator-BuildProject';
+    let toolkitProjectName = 'AWSAccelerator-ToolkitProject';
+
+    //
+    // Change the fields when qualifier is present
+    if (this.props.qualifier) {
+      acceleratorKeyArnSsmParameterName = `/accelerator/${this.props.qualifier}/installer/kms/key-arn`;
+      secureBucketName = `${this.props.qualifier}-pipeline-${cdk.Stack.of(this).account}-${cdk.Stack.of(this).region}`;
+      serverAccessLogsBucketName = `/accelerator/${this.props.qualifier}/installer-access-logs-bucket-name`;
+      configRepositoryName = `${this.props.qualifier}-config`;
+      pipelineName = `${this.props.qualifier}-pipeline`;
+      buildProjectName = `${this.props.qualifier}-build-project`;
+      toolkitProjectName = `${this.props.qualifier}-toolkit-project`;
+    }
+
     let pipelineAccountEnvVariables: { [p: string]: codebuild.BuildEnvironmentVariable } | undefined;
 
-    if (props.managementAccountId && props.managementAccountRoleName) {
+    if (this.props.managementAccountId && this.props.managementAccountRoleName) {
       pipelineAccountEnvVariables = {
         MANAGEMENT_ACCOUNT_ID: {
           type: codebuild.BuildEnvironmentVariableType.PLAINTEXT,
-          value: props.managementAccountId,
+          value: this.props.managementAccountId,
         },
         MANAGEMENT_ACCOUNT_ROLE_NAME: {
           type: codebuild.BuildEnvironmentVariableType.PLAINTEXT,
-          value: props.managementAccountRoleName,
+          value: this.props.managementAccountRoleName,
         },
       };
     }
 
     // Get installer key
-    const installerKey = cdk.aws_kms.Key.fromKeyArn(
+    this.installerKey = cdk.aws_kms.Key.fromKeyArn(
       this,
       'AcceleratorKey',
-      cdk.aws_ssm.StringParameter.valueForStringParameter(
-        this,
-        props.qualifier
-          ? `/accelerator/${props.qualifier}/installer/kms/key-arn`
-          : '/accelerator/installer/kms/key-arn',
-      ),
+      cdk.aws_ssm.StringParameter.valueForStringParameter(this, acceleratorKeyArnSsmParameterName),
     ) as cdk.aws_kms.Key;
 
     const bucket = new Bucket(this, 'SecureBucket', {
       encryptionType: BucketEncryptionType.SSE_KMS,
-      s3BucketName: `${props.qualifier ?? 'aws-accelerator'}-pipeline-${cdk.Stack.of(this).account}-${
-        cdk.Stack.of(this).region
-      }`,
-      kmsKey: installerKey,
-      serverAccessLogsBucketName: cdk.aws_ssm.StringParameter.valueForStringParameter(
-        this,
-        props.qualifier
-          ? `/accelerator/${props.qualifier}/installer-access-logs-bucket-name`
-          : '/accelerator/installer-access-logs-bucket-name',
-      ),
+      s3BucketName: secureBucketName,
+      kmsKey: this.installerKey,
+      serverAccessLogsBucketName: cdk.aws_ssm.StringParameter.valueForStringParameter(this, serverAccessLogsBucketName),
     });
 
-    const configRepository = new config_repository.ConfigRepository(this, 'ConfigRepository', {
-      repositoryName: `${props.qualifier ?? 'aws-accelerator'}-config`,
-      repositoryBranchName: 'main',
-      description:
-        'AWS Accelerator configuration repository, created and initialized with default config file by pipeline',
-      managementAccountEmail: props.managementAccountEmail,
-      logArchiveAccountEmail: props.logArchiveAccountEmail,
-      auditAccountEmail: props.auditAccountEmail,
-    });
+    // When non default config repository name provided
+    let configRepository: cdk.aws_codecommit.IRepository | Repository;
+    let configRepositoryBranchName = 'main';
+
+    if (props.configRepositoryName !== configRepositoryName) {
+      configRepository = cdk.aws_codecommit.Repository.fromRepositoryName(
+        this,
+        'ConfigRepository',
+        props.configRepositoryName,
+      );
+      configRepositoryBranchName = props.configRepositoryBranchName ?? 'main';
+    } else {
+      configRepository = new config_repository.ConfigRepository(this, 'ConfigRepository', {
+        repositoryName: configRepositoryName,
+        repositoryBranchName: configRepositoryBranchName,
+        description:
+          'AWS Accelerator configuration repository, created and initialized with default config file by pipeline',
+        managementAccountEmail: this.props.managementAccountEmail,
+        logArchiveAccountEmail: this.props.logArchiveAccountEmail,
+        auditAccountEmail: this.props.auditAccountEmail,
+        controlTowerEnabled: this.props.controlTowerEnabled,
+      }).getRepository();
+
+      const cfnRepository = configRepository.node.defaultChild as codecommit.CfnRepository;
+      cfnRepository.applyRemovalPolicy(cdk.RemovalPolicy.RETAIN, { applyToUpdateReplacePolicy: true });
+    }
 
     /**
      * Pipeline
@@ -120,8 +163,8 @@ export class AcceleratorPipeline extends Construct {
       assumedBy: new iam.ServicePrincipal('codepipeline.amazonaws.com'),
     });
 
-    const pipeline = new codepipeline.Pipeline(this, 'Resource', {
-      pipelineName: props.qualifier ? `${props.qualifier}-pipeline` : 'AWSAccelerator-Pipeline',
+    this.pipeline = new codepipeline.Pipeline(this, 'Resource', {
+      pipelineName: pipelineName,
       artifactBucket: bucket.getS3Bucket(),
       role: this.pipelineRole,
     });
@@ -133,34 +176,34 @@ export class AcceleratorPipeline extends Construct {
       | cdk.aws_codepipeline_actions.CodeCommitSourceAction
       | cdk.aws_codepipeline_actions.GitHubSourceAction;
 
-    if (props.sourceRepository === 'codecommit') {
+    if (this.props.sourceRepository === 'codecommit') {
       sourceAction = new codepipeline_actions.CodeCommitSourceAction({
         actionName: 'Source',
-        repository: codecommit.Repository.fromRepositoryName(this, 'SourceRepo', props.sourceRepositoryName),
-        branch: props.sourceBranchName,
+        repository: codecommit.Repository.fromRepositoryName(this, 'SourceRepo', this.props.sourceRepositoryName),
+        branch: this.props.sourceBranchName,
         output: this.acceleratorRepoArtifact,
         trigger: codepipeline_actions.CodeCommitTrigger.NONE,
       });
     } else {
       sourceAction = new cdk.aws_codepipeline_actions.GitHubSourceAction({
         actionName: 'Source',
-        owner: props.sourceRepositoryOwner,
-        repo: props.sourceRepositoryName,
-        branch: props.sourceBranchName,
+        owner: this.props.sourceRepositoryOwner,
+        repo: this.props.sourceRepositoryName,
+        branch: this.props.sourceBranchName,
         oauthToken: cdk.SecretValue.secretsManager('accelerator/github-token'),
         output: this.acceleratorRepoArtifact,
         trigger: cdk.aws_codepipeline_actions.GitHubTrigger.NONE,
       });
     }
 
-    pipeline.addStage({
+    this.pipeline.addStage({
       stageName: 'Source',
       actions: [
         sourceAction,
         new codepipeline_actions.CodeCommitSourceAction({
           actionName: 'Configuration',
-          repository: configRepository.getRepository(),
-          branch: 'main',
+          repository: configRepository,
+          branch: configRepositoryBranchName,
           output: this.configRepoArtifact,
           trigger: codepipeline_actions.CodeCommitTrigger.NONE,
           variablesNamespace: 'Config-Vars',
@@ -176,19 +219,30 @@ export class AcceleratorPipeline extends Construct {
     });
 
     const buildProject = new codebuild.PipelineProject(this, 'BuildProject', {
-      projectName: props.qualifier ? `${props.qualifier}-build-project` : 'AWSAccelerator-BuildProject',
-      encryptionKey: installerKey,
+      projectName: buildProjectName,
+      encryptionKey: this.installerKey,
       role: buildRole,
       buildSpec: codebuild.BuildSpec.fromObject({
         version: '0.2',
         phases: {
           install: {
             'runtime-versions': {
-              nodejs: 14,
+              nodejs: 16,
             },
           },
           build: {
-            commands: ['env', 'cd source', 'yarn install', 'yarn lerna link', 'yarn build'],
+            commands: [
+              'env',
+              'cd source',
+              `if [ "${cdk.Stack.of(this).partition}" = "aws-cn" ]; then
+                  sed -i "s#registry.yarnpkg.com#registry.npmmirror.com#g" yarn.lock;
+                  yarn config set registry https://registry.npmmirror.com
+               fi`,
+              'yarn install',
+              'yarn lerna link',
+              'yarn build',
+              'yarn validate-config $CODEBUILD_SRC_DIR_Config',
+            ],
           },
         },
         artifacts: {
@@ -197,13 +251,13 @@ export class AcceleratorPipeline extends Construct {
         },
       }),
       environment: {
-        buildImage: codebuild.LinuxBuildImage.STANDARD_5_0,
-        privileged: true, // Allow access to the Docker daemon
+        buildImage: codebuild.LinuxBuildImage.STANDARD_6_0,
+        privileged: false, // Allow access to the Docker daemon
         computeType: codebuild.ComputeType.MEDIUM,
         environmentVariables: {
           NODE_OPTIONS: {
             type: codebuild.BuildEnvironmentVariableType.PLAINTEXT,
-            value: '--max_old_space_size=4096',
+            value: '--max_old_space_size=8192',
           },
         },
       },
@@ -212,7 +266,7 @@ export class AcceleratorPipeline extends Construct {
 
     this.buildOutput = new codepipeline.Artifact('Build');
 
-    pipeline.addStage({
+    this.pipeline.addStage({
       stageName: 'Build',
       actions: [
         new codepipeline_actions.CodeBuildAction({
@@ -231,16 +285,16 @@ export class AcceleratorPipeline extends Construct {
      */
 
     this.toolkitProject = new codebuild.PipelineProject(this, 'ToolkitProject', {
-      projectName: props.qualifier ? `${props.qualifier}-toolkit-project` : 'AWSAccelerator-ToolkitProject',
-      encryptionKey: installerKey,
-      role: props.toolkitRole,
+      projectName: toolkitProjectName,
+      encryptionKey: this.installerKey,
+      role: this.props.toolkitRole,
       timeout: cdk.Duration.hours(5),
       buildSpec: codebuild.BuildSpec.fromObject({
         version: '0.2',
         phases: {
           install: {
             'runtime-versions': {
-              nodejs: 14,
+              nodejs: 16,
             },
           },
           build: {
@@ -256,13 +310,17 @@ export class AcceleratorPipeline extends Construct {
         },
       }),
       environment: {
-        buildImage: codebuild.LinuxBuildImage.STANDARD_5_0,
-        privileged: true, // Allow access to the Docker daemon
-        computeType: codebuild.ComputeType.MEDIUM,
+        buildImage: codebuild.LinuxBuildImage.STANDARD_6_0,
+        privileged: false, // Allow access to the Docker daemon
+        computeType: codebuild.ComputeType.LARGE,
         environmentVariables: {
           NODE_OPTIONS: {
             type: codebuild.BuildEnvironmentVariableType.PLAINTEXT,
-            value: '--max_old_space_size=4096',
+            value: '--max_old_space_size=8192',
+          },
+          CDK_METHOD: {
+            type: codebuild.BuildEnvironmentVariableType.PLAINTEXT,
+            value: 'direct',
           },
           CDK_NEW_BOOTSTRAP: {
             type: codebuild.BuildEnvironmentVariableType.PLAINTEXT,
@@ -270,7 +328,7 @@ export class AcceleratorPipeline extends Construct {
           },
           ACCELERATOR_QUALIFIER: {
             type: codebuild.BuildEnvironmentVariableType.PLAINTEXT,
-            value: props.qualifier ? props.qualifier : 'aws-accelerator',
+            value: this.props.qualifier ? this.props.qualifier : 'aws-accelerator',
           },
           ...pipelineAccountEnvVariables,
         },
@@ -284,52 +342,26 @@ export class AcceleratorPipeline extends Construct {
     //  * Creates the accounts
     //  * Creates the ou's if control tower is not enabled
     //  */
-    pipeline.addStage({
+    this.pipeline.addStage({
       stageName: 'Prepare',
       actions: [this.createToolkitStage({ actionName: 'Prepare', command: 'deploy', stage: AcceleratorStage.PREPARE })],
     });
 
-    pipeline.addStage({
+    this.pipeline.addStage({
       stageName: 'Accounts',
       actions: [
         this.createToolkitStage({ actionName: 'Accounts', command: 'deploy', stage: AcceleratorStage.ACCOUNTS }),
       ],
     });
 
-    pipeline.addStage({
+    this.pipeline.addStage({
       stageName: 'Bootstrap',
       actions: [this.createToolkitStage({ actionName: 'Bootstrap', command: `bootstrap` })],
     });
 
-    if (props.enableApprovalStage) {
-      let notificationTopic: cdk.aws_sns.Topic | undefined;
-
-      if (props.partition === 'aws') {
-        notificationTopic = new cdk.aws_sns.Topic(this, 'ManualApprovalActionTopic', {
-          topicName: (props.qualifier ? props.qualifier : 'aws-accelerator') + '-pipeline-review-topic',
-          displayName: (props.qualifier ? props.qualifier : 'aws-accelerator') + '-pipeline-review-topic',
-          masterKey: installerKey,
-        });
-      }
-
-      pipeline.addStage({
-        stageName: 'Review',
-        actions: [
-          this.createToolkitStage({ actionName: 'Diff', command: 'diff', runOrder: 1 }),
-          new codepipeline_actions.ManualApprovalAction({
-            actionName: 'Approve',
-            runOrder: 2,
-            additionalInformation: 'See previous stage (Diff) for changes.',
-            notificationTopic,
-            notifyEmails: notificationTopic
-              ? props.approvalStageNotifyEmailList
-                ? props.approvalStageNotifyEmailList.split(',')
-                : undefined
-              : undefined,
-          }),
-        ],
-      });
-    }
+    //
+    // Add review stage based on parameter
+    this.addReviewStage();
 
     /**
      * The Logging stack establishes all the logging assets that are needed in
@@ -339,7 +371,7 @@ export class AcceleratorPipeline extends Construct {
      * - The Central Logs bucket in the log-archive account
      *
      */
-    pipeline.addStage({
+    this.pipeline.addStage({
       stageName: 'Logging',
       actions: [
         this.createToolkitStage({ actionName: 'Key', command: 'deploy', stage: AcceleratorStage.KEY, runOrder: 1 }),
@@ -352,7 +384,7 @@ export class AcceleratorPipeline extends Construct {
       ],
     });
 
-    pipeline.addStage({
+    this.pipeline.addStage({
       stageName: 'Organization',
       actions: [
         this.createToolkitStage({
@@ -363,7 +395,7 @@ export class AcceleratorPipeline extends Construct {
       ],
     });
 
-    pipeline.addStage({
+    this.pipeline.addStage({
       stageName: 'SecurityAudit',
       actions: [
         this.createToolkitStage({
@@ -374,12 +406,7 @@ export class AcceleratorPipeline extends Construct {
       ],
     });
 
-    // pipeline.addStage({
-    //   stageName: 'Dependencies',
-    //   actions: [this.createToolkitStage('Dependencies', `deploy --stage ${AcceleratorStage.DEPENDENCIES}`)],
-    // });
-
-    pipeline.addStage({
+    this.pipeline.addStage({
       stageName: 'Deploy',
       actions: [
         this.createToolkitStage({
@@ -419,75 +446,60 @@ export class AcceleratorPipeline extends Construct {
           runOrder: 3,
         }),
         this.createToolkitStage({
+          actionName: 'Customizations',
+          command: 'deploy',
+          stage: AcceleratorStage.CUSTOMIZATIONS,
+          runOrder: 4,
+        }),
+        this.createToolkitStage({
           actionName: 'Finalize',
           command: 'deploy',
           stage: AcceleratorStage.FINALIZE,
-          runOrder: 4,
+          runOrder: 5,
         }),
       ],
     });
 
-    // Enable Pipeline notification
-    if (props.partition === 'aws') {
-      const codeStarNotificationsRole = new cdk.aws_iam.CfnServiceLinkedRole(
-        this,
-        'AWSServiceRoleForCodeStarNotifications',
-        {
-          awsServiceName: 'codestar-notifications.amazonaws.com',
-          description: 'Allows AWS CodeStar Notifications to access Amazon CloudWatch Events on your behalf',
-        },
-      );
-      pipeline.node.addDependency(codeStarNotificationsRole);
+    // Enable pipeline notification for commercial partition
+    this.enablePipelineNotification();
+  }
 
-      const acceleratorStatusTopic = new cdk.aws_sns.Topic(this, 'AcceleratorStatusTopic', {
-        topicName: (props.qualifier ? props.qualifier : 'aws-accelerator') + '-pipeline-status-topic',
-        displayName: (props.qualifier ? props.qualifier : 'aws-accelerator') + '-pipeline-status-topic',
-        masterKey: installerKey,
+  /**
+   * Add review stage based on parameter
+   */
+  private addReviewStage() {
+    if (this.props.enableApprovalStage) {
+      const notificationTopic = new cdk.aws_sns.Topic(this, 'ManualApprovalActionTopic', {
+        topicName: (this.props.qualifier ? this.props.qualifier : 'aws-accelerator') + '-pipeline-review-topic',
+        displayName: (this.props.qualifier ? this.props.qualifier : 'aws-accelerator') + '-pipeline-review-topic',
+        masterKey: this.installerKey,
       });
 
-      acceleratorStatusTopic.grantPublish(pipeline.role);
+      let notifyEmails: string[] | undefined = undefined;
 
-      pipeline.notifyOn('AcceleratorPipelineStatusNotification', acceleratorStatusTopic, {
-        events: [
-          cdk.aws_codepipeline.PipelineNotificationEvents.MANUAL_APPROVAL_FAILED,
-          cdk.aws_codepipeline.PipelineNotificationEvents.MANUAL_APPROVAL_NEEDED,
-          cdk.aws_codepipeline.PipelineNotificationEvents.MANUAL_APPROVAL_SUCCEEDED,
-          cdk.aws_codepipeline.PipelineNotificationEvents.PIPELINE_EXECUTION_CANCELED,
-          cdk.aws_codepipeline.PipelineNotificationEvents.PIPELINE_EXECUTION_FAILED,
-          cdk.aws_codepipeline.PipelineNotificationEvents.PIPELINE_EXECUTION_RESUMED,
-          cdk.aws_codepipeline.PipelineNotificationEvents.PIPELINE_EXECUTION_STARTED,
-          cdk.aws_codepipeline.PipelineNotificationEvents.PIPELINE_EXECUTION_SUCCEEDED,
-          cdk.aws_codepipeline.PipelineNotificationEvents.PIPELINE_EXECUTION_SUPERSEDED,
+      if (notificationTopic) {
+        if (this.props.approvalStageNotifyEmailList) {
+          notifyEmails = this.props.approvalStageNotifyEmailList.split(',');
+        }
+      }
+
+      this.pipeline.addStage({
+        stageName: 'Review',
+        actions: [
+          this.createToolkitStage({ actionName: 'Diff', command: 'diff', runOrder: 1 }),
+          new codepipeline_actions.ManualApprovalAction({
+            actionName: 'Approve',
+            runOrder: 2,
+            additionalInformation: 'See previous stage (Diff) for changes.',
+            notificationTopic,
+            notifyEmails,
+          }),
         ],
       });
-
-      // Pipeline failure status topic and alarm
-      const acceleratorFailedStatusTopic = new cdk.aws_sns.Topic(this, 'AcceleratorFailedStatusTopic', {
-        topicName: (props.qualifier ? props.qualifier : 'aws-accelerator') + '-pipeline-failed-status-topic',
-        displayName: (props.qualifier ? props.qualifier : 'aws-accelerator') + '-pipeline-failed-status-topic',
-        masterKey: installerKey,
-      });
-
-      acceleratorFailedStatusTopic.grantPublish(pipeline.role);
-
-      pipeline.notifyOn('AcceleratorPipelineFailureNotification', acceleratorFailedStatusTopic, {
-        events: [cdk.aws_codepipeline.PipelineNotificationEvents.PIPELINE_EXECUTION_FAILED],
-      });
-
-      acceleratorFailedStatusTopic
-        .metricNumberOfMessagesPublished()
-        .createAlarm(this, 'AcceleratorPipelineFailureAlarm', {
-          threshold: 1,
-          evaluationPeriods: 1,
-          datapointsToAlarm: 1,
-          treatMissingData: cdk.aws_cloudwatch.TreatMissingData.NOT_BREACHING,
-          alarmName: props.qualifier ? props.qualifier + '-pipeline-failed-alarm' : 'AwsAcceleratorFailedAlarm',
-          alarmDescription: 'AWS Accelerator pipeline failure alarm, created by accelerator',
-        });
     }
   }
 
-  private createToolkitStage(props: {
+  private createToolkitStage(stageProps: {
     actionName: string;
     command: string;
     stage?: string;
@@ -495,12 +507,12 @@ export class AcceleratorPipeline extends Construct {
   }): codepipeline_actions.CodeBuildAction {
     let cdkOptions;
     if (
-      props.command === AcceleratorToolkitCommand.BOOTSTRAP.toString() ||
-      props.command === AcceleratorToolkitCommand.DIFF.toString()
+      stageProps.command === AcceleratorToolkitCommand.BOOTSTRAP.toString() ||
+      stageProps.command === AcceleratorToolkitCommand.DIFF.toString()
     ) {
-      cdkOptions = props.command;
+      cdkOptions = stageProps.command;
     } else {
-      cdkOptions = `${props.command} --stage ${props.stage}`;
+      cdkOptions = `${stageProps.command} --stage ${stageProps.stage}`;
     }
 
     const environmentVariables: {
@@ -516,21 +528,106 @@ export class AcceleratorPipeline extends Construct {
       },
     };
 
-    if (props.stage) {
+    if (stageProps.stage) {
       environmentVariables['ACCELERATOR_STAGE'] = {
         type: codebuild.BuildEnvironmentVariableType.PLAINTEXT,
-        value: props.stage ?? '',
+        value: stageProps.stage ?? '',
       };
     }
 
     return new codepipeline_actions.CodeBuildAction({
-      actionName: props.actionName,
-      runOrder: props.runOrder,
+      actionName: stageProps.actionName,
+      runOrder: stageProps.runOrder,
       project: this.toolkitProject,
       input: this.buildOutput,
       extraInputs: [this.configRepoArtifact],
       role: this.pipelineRole,
       environmentVariables,
     });
+  }
+
+  /**
+   * Enable pipeline notification for commercial partition and supported regions
+   */
+  private enablePipelineNotification() {
+    // List of regions with AWS CodeStar being supported. For details, see documentation:
+    // https://aws.amazon.com/about-aws/global-infrastructure/regional-product-services/
+    const awsCodeStarSupportedRegions = [
+      'us-east-1',
+      'us-east-2',
+      'us-west-1',
+      'us-west-2',
+      'ap-northeast-2',
+      'ap-southeast-1',
+      'ap-southeast-2',
+      'ap-northeast-1',
+      'ca-central-1',
+      'eu-central-1',
+      'eu-west-1',
+      'eu-west-2',
+      'eu-north-1',
+    ];
+
+    // We can Enable pipeline notification only for regions with AWS CodeStar being available
+    if (awsCodeStarSupportedRegions.includes(cdk.Stack.of(this).region)) {
+      const codeStarNotificationsRole = new cdk.aws_iam.CfnServiceLinkedRole(
+        this,
+        'AWSServiceRoleForCodeStarNotifications',
+        {
+          awsServiceName: 'codestar-notifications.amazonaws.com',
+          description: 'Allows AWS CodeStar Notifications to access Amazon CloudWatch Events on your behalf',
+        },
+      );
+      this.pipeline.node.addDependency(codeStarNotificationsRole);
+
+      const acceleratorStatusTopic = new cdk.aws_sns.Topic(this, 'AcceleratorStatusTopic', {
+        topicName: (this.props.qualifier ? this.props.qualifier : 'aws-accelerator') + '-pipeline-status-topic',
+        displayName: (this.props.qualifier ? this.props.qualifier : 'aws-accelerator') + '-pipeline-status-topic',
+        masterKey: this.installerKey,
+      });
+
+      acceleratorStatusTopic.grantPublish(this.pipeline.role);
+
+      this.pipeline.notifyOn('AcceleratorPipelineStatusNotification', acceleratorStatusTopic, {
+        events: [
+          cdk.aws_codepipeline.PipelineNotificationEvents.MANUAL_APPROVAL_FAILED,
+          cdk.aws_codepipeline.PipelineNotificationEvents.MANUAL_APPROVAL_NEEDED,
+          cdk.aws_codepipeline.PipelineNotificationEvents.MANUAL_APPROVAL_SUCCEEDED,
+          cdk.aws_codepipeline.PipelineNotificationEvents.PIPELINE_EXECUTION_CANCELED,
+          cdk.aws_codepipeline.PipelineNotificationEvents.PIPELINE_EXECUTION_FAILED,
+          cdk.aws_codepipeline.PipelineNotificationEvents.PIPELINE_EXECUTION_RESUMED,
+          cdk.aws_codepipeline.PipelineNotificationEvents.PIPELINE_EXECUTION_STARTED,
+          cdk.aws_codepipeline.PipelineNotificationEvents.PIPELINE_EXECUTION_SUCCEEDED,
+          cdk.aws_codepipeline.PipelineNotificationEvents.PIPELINE_EXECUTION_SUPERSEDED,
+        ],
+      });
+
+      // Pipeline failure status topic and alarm
+      const acceleratorFailedStatusTopic = new cdk.aws_sns.Topic(this, 'AcceleratorFailedStatusTopic', {
+        topicName: (this.props.qualifier ? this.props.qualifier : 'aws-accelerator') + '-pipeline-failed-status-topic',
+        displayName:
+          (this.props.qualifier ? this.props.qualifier : 'aws-accelerator') + '-pipeline-failed-status-topic',
+        masterKey: this.installerKey,
+      });
+
+      acceleratorFailedStatusTopic.grantPublish(this.pipeline.role);
+
+      this.pipeline.notifyOn('AcceleratorPipelineFailureNotification', acceleratorFailedStatusTopic, {
+        events: [cdk.aws_codepipeline.PipelineNotificationEvents.PIPELINE_EXECUTION_FAILED],
+      });
+
+      acceleratorFailedStatusTopic
+        .metricNumberOfMessagesPublished()
+        .createAlarm(this, 'AcceleratorPipelineFailureAlarm', {
+          threshold: 1,
+          evaluationPeriods: 1,
+          datapointsToAlarm: 1,
+          treatMissingData: cdk.aws_cloudwatch.TreatMissingData.NOT_BREACHING,
+          alarmName: this.props.qualifier
+            ? this.props.qualifier + '-pipeline-failed-alarm'
+            : 'AwsAcceleratorFailedAlarm',
+          alarmDescription: 'AWS Accelerator pipeline failure alarm, created by accelerator',
+        });
+    }
   }
 }

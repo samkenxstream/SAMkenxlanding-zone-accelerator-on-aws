@@ -14,7 +14,6 @@
 import * as cdk from 'aws-cdk-lib';
 import { v4 as uuidv4 } from 'uuid';
 import { Construct } from 'constructs';
-import { Duration } from 'aws-cdk-lib';
 import path = require('path');
 
 export interface ValidateEnvironmentConfigProps {
@@ -22,11 +21,14 @@ export interface ValidateEnvironmentConfigProps {
   readonly newOrgAccountsTable: cdk.aws_dynamodb.ITable;
   readonly newCTAccountsTable: cdk.aws_dynamodb.ITable;
   readonly controlTowerEnabled: boolean;
+  readonly organizationsEnabled: boolean;
   readonly commitId: string;
   readonly stackName: string;
   readonly region: string;
   readonly managementAccountId: string;
   readonly partition: string;
+  readonly driftDetectionParameter: cdk.aws_ssm.IParameter;
+  readonly driftDetectionMessageParameter: cdk.aws_ssm.IParameter;
   /**
    * Custom resource lambda log group encryption key
    */
@@ -54,15 +56,20 @@ export class ValidateEnvironmentConfig extends Construct {
     const provider = cdk.CustomResourceProvider.getOrCreateProvider(this, VALIDATE_ENVIRONMENT_RESOURCE_TYPE, {
       codeDirectory: path.join(__dirname, 'lambdas/validate-environment/dist'),
       runtime: cdk.CustomResourceProviderRuntime.NODEJS_14_X,
-      timeout: Duration.minutes(10),
+      timeout: cdk.Duration.minutes(10),
       policyStatements: [
         {
-          Sid: 'organizations',
           Effect: 'Allow',
+          Sid: 'OrganizationsLookup',
           Action: [
             'organizations:ListAccounts',
             'servicecatalog:SearchProvisionedProducts',
             'organizations:ListChildren',
+            'organizations:ListPoliciesForTarget',
+            'organizations:ListOrganizationalUnitsForParent',
+            'organizations:ListRoots',
+            'organizations:ListAccountsForParent',
+            'organizations:ListParents',
           ],
           Resource: '*',
         },
@@ -92,6 +99,12 @@ export class ValidateEnvironmentConfig extends Construct {
             `arn:${props.partition}:cloudformation:${props.region}:${props.managementAccountId}:stack/${props.stackName}*`,
           ],
         },
+        {
+          Sid: 'sms',
+          Effect: 'Allow',
+          Action: ['ssm:GetParameter'],
+          Resource: [props.driftDetectionParameter.parameterArn, props.driftDetectionMessageParameter.parameterArn],
+        },
       ],
     });
 
@@ -108,8 +121,12 @@ export class ValidateEnvironmentConfig extends Construct {
         newOrgAccountsTableName: props.newOrgAccountsTable.tableName,
         newCTAccountsTableName: props.newCTAccountsTable?.tableName || '',
         controlTowerEnabled: props.controlTowerEnabled,
+        organizationsEnabled: props.organizationsEnabled,
         commitId: props.commitId,
         stackName: props.stackName,
+        partition: props.partition,
+        driftDetectionParameterName: props.driftDetectionParameter.parameterName,
+        driftDetectionMessageParameterName: props.driftDetectionMessageParameter.parameterName,
         uuid: uuidv4(), // Generates a new UUID to force the resource to update
       },
     });

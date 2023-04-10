@@ -12,7 +12,6 @@
  */
 
 import * as cdk from 'aws-cdk-lib';
-import { RetentionDays } from 'aws-cdk-lib/aws-logs';
 import { Construct } from 'constructs';
 const path = require('path');
 
@@ -26,10 +25,13 @@ export interface SsmSessionManagerSettingsProps {
   readonly sendToS3: boolean;
   readonly sendToCloudWatchLogs: boolean;
   readonly cloudWatchEncryptionEnabled: boolean;
+  readonly attachPolicyToIamRoles?: string[];
+  readonly cloudWatchEncryptionKey: cdk.aws_kms.IKey;
+  readonly region: string;
   /**
    * Custom resource lambda log group encryption key
    */
-  readonly kmsKey: cdk.aws_kms.Key;
+  readonly constructLoggingKmsKey: cdk.aws_kms.IKey;
   /**
    * Custom resource lambda log retention in days
    */
@@ -42,7 +44,24 @@ export class SsmSessionManagerSettings extends Construct {
   constructor(scope: Construct, id: string, props: SsmSessionManagerSettingsProps) {
     super(scope, id);
 
-    const sessionManagerEC2PolicyDocument = new cdk.aws_iam.PolicyDocument({
+    // Regional policy document
+    const sessionManagerRegionalEC2PolicyDocument = new cdk.aws_iam.PolicyDocument({
+      statements: [
+        new cdk.aws_iam.PolicyStatement({
+          effect: cdk.aws_iam.Effect.ALLOW,
+          actions: [
+            'ssmmessages:CreateControlChannel',
+            'ssmmessages:CreateDataChannel',
+            'ssmmessages:OpenControlChannel',
+            'ssmmessages:OpenDataChannel',
+            'ssm:UpdateInstanceInformation',
+          ],
+          resources: ['*'],
+        }),
+      ],
+    });
+
+    const sessionManagerRegionEC2Policy = new cdk.aws_iam.Policy(this, `SessionPolicy${props.region}`, {
       statements: [
         new cdk.aws_iam.PolicyStatement({
           effect: cdk.aws_iam.Effect.ALLOW,
@@ -60,61 +79,52 @@ export class SsmSessionManagerSettings extends Construct {
 
     let sessionManagerLogGroupName = '';
     if (props.sendToCloudWatchLogs) {
-      const sessionManagerLogsCmk = new cdk.aws_kms.Key(this, 'SessionManagerLogsCmk', {
-        enableKeyRotation: true,
-        description: 'AWS Accelerator Cloud Watch Logs CMK for Session Manager Logs',
-        alias: 'accelerator/session-manager-logging/cloud-watch-logs',
-      });
-
-      sessionManagerLogsCmk.addToResourcePolicy(
-        new cdk.aws_iam.PolicyStatement({
-          sid: 'Enable IAM User Permissions',
-          principals: [new cdk.aws_iam.AccountRootPrincipal()],
-          actions: ['kms:*'],
-          resources: ['*'],
-        }),
-      );
-
-      sessionManagerLogsCmk.addToResourcePolicy(
-        new cdk.aws_iam.PolicyStatement({
-          sid: 'Allow Cloud Watch Logs access',
-          principals: [new cdk.aws_iam.ServicePrincipal(`logs.${cdk.Stack.of(this).region}.amazonaws.com`)],
-          actions: ['kms:Encrypt*', 'kms:Decrypt*', 'kms:ReEncrypt*', 'kms:GenerateDataKey*', 'kms:Describe*'],
-          resources: ['*'],
-          conditions: {
-            ArnLike: {
-              'kms:EncryptionContext:aws:logs:arn': `arn:${cdk.Stack.of(this).partition}:logs:${
-                cdk.Stack.of(this).region
-              }:${cdk.Stack.of(this).account}:*`,
-            },
-          },
-        }),
-      );
-
-      const logGroupName = 'aws-accelerator-session-manager-logs';
-      const sessionManagerLogGroup = new cdk.aws_logs.LogGroup(this, 'sessionManagerLogGroup', {
-        retention: RetentionDays.TEN_YEARS,
+      // Per region CloudWatch Logs
+      const logGroupName = 'aws-accelerator-sessionmanager-logs';
+      const sessionManagerLogGroup = new cdk.aws_logs.LogGroup(this, 'SessionManagerCloudWatchLogGroup', {
+        retention: props.logRetentionInDays,
         logGroupName: logGroupName,
-        encryptionKey: sessionManagerLogsCmk,
+        encryptionKey: props.cloudWatchEncryptionKey,
       });
       sessionManagerLogGroupName = sessionManagerLogGroup.logGroupName;
 
-      //Build Session Manager EC2 IAM Policy Document to allow writing to CW logs
-      sessionManagerEC2PolicyDocument.addStatements(
+      // Build Session Manager EC2 IAM Policy Document to allow writing to CW logs
+      sessionManagerRegionalEC2PolicyDocument.addStatements(
         new cdk.aws_iam.PolicyStatement({
+          sid: 'CloudWatchDescribe',
           effect: cdk.aws_iam.Effect.ALLOW,
           actions: ['logs:DescribeLogGroups'],
           resources: [
-            `arn:${cdk.Stack.of(this).partition}:logs:${cdk.Stack.of(this).region}:${
-              cdk.Stack.of(this).account
-            }:log-group:*`,
+            `arn:${cdk.Stack.of(this).partition}:logs:${props.region}:${cdk.Stack.of(this).account}:log-group:*`,
           ],
         }),
         new cdk.aws_iam.PolicyStatement({
+          sid: 'CloudWatchLogs',
           effect: cdk.aws_iam.Effect.ALLOW,
-          actions: ['logs:CreateLogStream', 'logs:PutLogEvents', 'logs:DescribeLogStreams'],
+          actions: ['logs:CreateLogStream', 'logs:PutLogEvents', 'logs:DescribeLogStreams', 'logs:DescribeLogGroups'],
           resources: [
-            `arn:${cdk.Stack.of(this).partition}:logs:${cdk.Stack.of(this).region}:${
+            `arn:${cdk.Stack.of(this).partition}:logs:${props.region}:${
+              cdk.Stack.of(this).account
+            }:log-group:${logGroupName}:*`,
+          ],
+        }),
+      );
+
+      sessionManagerRegionEC2Policy.addStatements(
+        new cdk.aws_iam.PolicyStatement({
+          sid: 'CloudWatchDescribe',
+          effect: cdk.aws_iam.Effect.ALLOW,
+          actions: ['logs:DescribeLogGroups'],
+          resources: [
+            `arn:${cdk.Stack.of(this).partition}:logs:${props.region}:${cdk.Stack.of(this).account}:log-group:*`,
+          ],
+        }),
+        new cdk.aws_iam.PolicyStatement({
+          sid: 'CloudWatchLogs',
+          effect: cdk.aws_iam.Effect.ALLOW,
+          actions: ['logs:CreateLogStream', 'logs:PutLogEvents', 'logs:DescribeLogStreams', 'logs:DescribeLogGroups'],
+          resources: [
+            `arn:${cdk.Stack.of(this).partition}:logs:${props.region}:${
               cdk.Stack.of(this).account
             }:log-group:${logGroupName}:*`,
           ],
@@ -126,9 +136,11 @@ export class SsmSessionManagerSettings extends Construct {
       if (!props.s3BucketKeyArn || !props.s3BucketName) {
         throw new Error('Bucket Key Arn and Bucket Name must be provided');
       } else {
-        //Build Session Manager EC2 IAM Policy Document to allow writing to S3
-        sessionManagerEC2PolicyDocument.addStatements(
+        // Build Session Manager EC2 IAM Policy Document to allow writing to S3
+        // Central Logs Bucket
+        sessionManagerRegionalEC2PolicyDocument.addStatements(
           new cdk.aws_iam.PolicyStatement({
+            sid: 'S3CentralLogs',
             effect: cdk.aws_iam.Effect.ALLOW,
             actions: ['s3:PutObject', 's3:PutObjectAcl'],
             resources: [
@@ -138,11 +150,38 @@ export class SsmSessionManagerSettings extends Construct {
             ],
           }),
           new cdk.aws_iam.PolicyStatement({
+            sid: 'S3CentralLogsEncryptionConfig',
             effect: cdk.aws_iam.Effect.ALLOW,
             actions: ['s3:GetEncryptionConfiguration'],
             resources: [`arn:${cdk.Stack.of(this).partition}:s3:::${props.s3BucketName}`],
           }),
           new cdk.aws_iam.PolicyStatement({
+            sid: 'S3CentralLogsEncryption',
+            effect: cdk.aws_iam.Effect.ALLOW,
+            actions: ['kms:Decrypt', 'kms:GenerateDataKey'],
+            resources: [props.s3BucketKeyArn],
+          }),
+        );
+
+        sessionManagerRegionEC2Policy.addStatements(
+          new cdk.aws_iam.PolicyStatement({
+            sid: 'S3CentralLogs',
+            effect: cdk.aws_iam.Effect.ALLOW,
+            actions: ['s3:PutObject', 's3:PutObjectAcl'],
+            resources: [
+              `arn:${cdk.Stack.of(this).partition}:s3:::${props.s3BucketName}/${
+                props.s3KeyPrefix ? props.s3KeyPrefix + '/*' : '*'
+              }`,
+            ],
+          }),
+          new cdk.aws_iam.PolicyStatement({
+            sid: 'S3CentralLogsEncryptionConfig',
+            effect: cdk.aws_iam.Effect.ALLOW,
+            actions: ['s3:GetEncryptionConfiguration'],
+            resources: [`arn:${cdk.Stack.of(this).partition}:s3:::${props.s3BucketName}`],
+          }),
+          new cdk.aws_iam.PolicyStatement({
+            sid: 'S3CentralLogsEncryption',
             effect: cdk.aws_iam.Effect.ALLOW,
             actions: ['kms:Decrypt', 'kms:GenerateDataKey'],
             resources: [props.s3BucketKeyArn],
@@ -152,39 +191,15 @@ export class SsmSessionManagerSettings extends Construct {
     }
 
     let sessionManagerSessionCmk: cdk.aws_kms.Key | undefined = undefined;
-    sessionManagerSessionCmk = new cdk.aws_kms.Key(this, 'SessionManagerSessionCmk', {
+    sessionManagerSessionCmk = new cdk.aws_kms.Key(this, 'SessionManagerSessionKey', {
       enableKeyRotation: true,
-      description: 'AWS Accelerator Cloud Watch Logs CMK for Session Manager Logs',
-      alias: 'accelerator/session-manager-logging/session',
+      description: 'AWS Accelerator Session Manager Session Encryption',
     });
 
-    sessionManagerSessionCmk.addToResourcePolicy(
-      new cdk.aws_iam.PolicyStatement({
-        sid: 'Enable IAM User Permissions',
-        principals: [new cdk.aws_iam.AccountRootPrincipal()],
-        actions: ['kms:*'],
-        resources: ['*'],
-      }),
-    );
-
-    sessionManagerSessionCmk.addToResourcePolicy(
-      new cdk.aws_iam.PolicyStatement({
-        sid: 'Allow Cloud Watch Logs access',
-        principals: [new cdk.aws_iam.ServicePrincipal(`logs.${cdk.Stack.of(this).region}.amazonaws.com`)],
-        actions: ['kms:Encrypt*', 'kms:Decrypt*', 'kms:ReEncrypt*', 'kms:GenerateDataKey*', 'kms:Describe*'],
-        resources: ['*'],
-        conditions: {
-          ArnLike: {
-            'kms:EncryptionContext:aws:logs:arn': `arn:${cdk.Stack.of(this).partition}:logs:${
-              cdk.Stack.of(this).region
-            }:${cdk.Stack.of(this).account}:*`,
-          },
-        },
-      }),
-    );
+    sessionManagerSessionCmk.addAlias('accelerator/sessionmanager-logs/session');
 
     //Build Session Manager EC2 IAM Policy Document to allow kms action for session key
-    sessionManagerEC2PolicyDocument.addStatements(
+    sessionManagerRegionalEC2PolicyDocument.addStatements(
       new cdk.aws_iam.PolicyStatement({
         effect: cdk.aws_iam.Effect.ALLOW,
         actions: ['kms:Decrypt'],
@@ -192,23 +207,43 @@ export class SsmSessionManagerSettings extends Construct {
       }),
     );
 
-    const sessionManagerEC2Policy = new cdk.aws_iam.ManagedPolicy(this, 'SessionManagerEC2Policy', {
-      document: sessionManagerEC2PolicyDocument,
-      managedPolicyName: `SessionManagerLogging-${cdk.Stack.of(this).region}`,
+    sessionManagerRegionEC2Policy.addStatements(
+      new cdk.aws_iam.PolicyStatement({
+        sid: 'sessionKey',
+        effect: cdk.aws_iam.Effect.ALLOW,
+        actions: ['kms:Decrypt'],
+        resources: [sessionManagerSessionCmk.keyArn],
+      }),
+    );
+
+    const sessionManagerRegionalEC2ManagedPolicy = new cdk.aws_iam.ManagedPolicy(this, 'SessionManagerEC2Policy', {
+      document: sessionManagerRegionalEC2PolicyDocument,
+      managedPolicyName: `AWSAccelerator-SessionManagerLogging-${props.region}`,
     });
 
-    //Create an EC2 role that can be used for Session Manager
+    // Attach policies to configured roles
+    for (const iamRoleName of props.attachPolicyToIamRoles ?? []) {
+      const role = cdk.aws_iam.Role.fromRoleArn(
+        this,
+        `AcceleratorSessionManager-${iamRoleName}`,
+        `arn:${cdk.Stack.of(this).partition}:iam::${cdk.Stack.of(this).account}:role/${iamRoleName}`,
+        { defaultPolicyName: `Region${props.region}` },
+      );
+      role.attachInlinePolicy(sessionManagerRegionEC2Policy);
+    }
+
+    // Create an EC2 role that can be used for Session Manager
     const sessionManagerEC2Role = new cdk.aws_iam.Role(this, 'SessionManagerEC2Role', {
-      assumedBy: new cdk.aws_iam.ServicePrincipal('ec2.amazonaws.com'),
+      assumedBy: new cdk.aws_iam.ServicePrincipal(`ec2.${cdk.Stack.of(this).urlSuffix}`),
       description: 'IAM Role for an EC2 configured for Session Manager Logging',
-      managedPolicies: [sessionManagerEC2Policy],
-      roleName: `SessionManagerEC2Role-${cdk.Stack.of(this).region}`,
+      managedPolicies: [sessionManagerRegionalEC2ManagedPolicy],
+      roleName: `AWSAccelerator-SessionManagerEC2Role-${props.region}`,
     });
 
-    //Create an EC2 instance profile
+    // Create an EC2 instance profile
     new cdk.aws_iam.CfnInstanceProfile(this, 'SessionManagerEC2InstanceProfile', {
       roles: [sessionManagerEC2Role.roleName],
-      instanceProfileName: `SessionManagerEc2Role-${cdk.Stack.of(this).region}`,
+      instanceProfileName: `AWSAccelerator-SessionManagerEc2Role-${props.region}`,
     });
 
     const sessionManagerUserPolicyDocument = new cdk.aws_iam.PolicyDocument({
@@ -221,10 +256,10 @@ export class SsmSessionManagerSettings extends Construct {
       ],
     });
 
-    //Create an IAM Policy for users to be able to use Session Manager with KMS encryption
+    // Create an IAM Policy for users to be able to use Session Manager with KMS encryption
     new cdk.aws_iam.ManagedPolicy(this, 'SessionManagerUserKMSPolicy', {
       document: sessionManagerUserPolicyDocument,
-      managedPolicyName: `SessionManagerUserKMSPolicy-${cdk.Stack.of(this).region}`,
+      managedPolicyName: `AWSAccelerator-SessionManagerUserKMS-${props.region}`,
     });
 
     //
@@ -265,7 +300,7 @@ export class SsmSessionManagerSettings extends Construct {
       new cdk.aws_logs.LogGroup(stack, `${provider.node.id}LogGroup`, {
         logGroupName: `/aws/lambda/${(provider.node.findChild('Handler') as cdk.aws_lambda.CfnFunction).ref}`,
         retention: props.logRetentionInDays,
-        encryptionKey: props.kmsKey,
+        encryptionKey: props.constructLoggingKmsKey,
         removalPolicy: cdk.RemovalPolicy.DESTROY,
       });
     resource.node.addDependency(logGroup);

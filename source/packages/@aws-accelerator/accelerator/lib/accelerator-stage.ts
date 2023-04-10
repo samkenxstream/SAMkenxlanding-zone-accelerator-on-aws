@@ -27,6 +27,8 @@ export enum AcceleratorStage {
    * Accounts Stage - Handle all Organization and Accounts actions
    */
   ACCOUNTS = 'accounts',
+  BOOTSTRAP = 'bootstrap',
+  CUSTOMIZATIONS = 'customizations',
   DEPENDENCIES = 'dependencies',
   SECURITY = 'security',
   SECURITY_RESOURCES = 'security-resources',
@@ -36,6 +38,7 @@ export enum AcceleratorStage {
   NETWORK_VPC_ENDPOINTS = 'network-vpc-endpoints',
   NETWORK_VPC_DNS = 'network-vpc-dns',
   NETWORK_ASSOCIATIONS = 'network-associations',
+  NETWORK_ASSOCIATIONS_GWLB = 'network-associations-gwlb',
   SECURITY_AUDIT = 'security-audit',
   FINALIZE = 'finalize',
 }

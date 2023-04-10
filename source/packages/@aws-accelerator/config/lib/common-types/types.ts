@@ -94,19 +94,19 @@ export class OptionalType<T extends t.Any> extends t.Type<
 
 export type WithSize = number | string | any[] | Map<any, any> | Set<any>;
 
-function getSize(sized: WithSize): number {
-  if (typeof sized === 'number') {
-    return sized;
-  } else if (typeof sized === 'string') {
-    return sized.length;
-  } else if (Array.isArray(sized)) {
-    return sized.length;
-  } else if (sized instanceof Set) {
-    return sized.size;
-  } else if (sized instanceof Map) {
-    return sized.size;
+function getSize(withSize: WithSize): number {
+  if (typeof withSize === 'number') {
+    return withSize;
+  } else if (typeof withSize === 'string') {
+    return withSize.length;
+  } else if (Array.isArray(withSize)) {
+    return withSize.length;
+  } else if (withSize instanceof Set) {
+    return withSize.size;
+  } else if (withSize instanceof Map) {
+    return withSize.size;
   }
-  throw new Error(`Unsupported size value ${sized}`);
+  throw new Error(`Unsupported size value ${withSize}`);
 }
 
 export interface SizedTypeProps {
@@ -117,8 +117,8 @@ export interface SizedTypeProps {
 }
 
 export class SizedType<A extends WithSize, T extends t.Type<A>> extends t.Type<T['_A'], T['_O'], T['_I']> {
-  readonly min?: number | undefined;
-  readonly max?: number | undefined;
+  readonly min?: number;
+  readonly max?: number;
 
   constructor(readonly type: T, readonly props: SizedTypeProps = {}) {
     super(
@@ -149,7 +149,7 @@ export interface EnumTypeProps {
 }
 
 export class EnumType<T extends string | number> extends t.Type<T> {
-  readonly _tag: 'EnumType' = 'EnumType';
+  readonly _tag = 'EnumType' as const;
 
   constructor(readonly values: ReadonlyArray<T>, props: EnumTypeProps) {
     super(
@@ -220,18 +220,24 @@ export const region = enums(
     'ap-northeast-2',
     'ap-northeast-3',
     'ap-south-1',
+    'ap-south-2',
     'ap-southeast-1',
     'ap-southeast-2',
+    'ap-southeast-3',
+    'ap-southeast-4',
     'ca-central-1',
     'cn-north-1',
     'cn-northwest-1',
     'eu-central-1',
+    'eu-central-2',
     'eu-north-1',
     'eu-south-1',
+    'eu-south-2',
     'eu-west-1',
     'eu-west-2',
     'eu-west-3',
     'me-south-1',
+    'me-central-1',
     'sa-east-1',
     'us-east-1',
     'us-east-2',
@@ -263,10 +269,10 @@ export class DeploymentTargets implements t.TypeOf<typeof deploymentTargets> {
 export const storageClass = enums('storageClass', [
   'DEEP_ARCHIVE',
   'GLACIER',
-  'GLACIER_INSTANT_RETRIEVAL',
-  'INFREQUENT_ACCESS',
+  'GLACIER_IR',
+  'STANDARD_IA',
   'INTELLIGENT_TIERING',
-  'ONE_ZONE_INFREQUENT_ACCESS',
+  'ONEZONE_IA',
   'Value should be an AWS S3 Storage Class.',
 ]);
 export type StorageClass = t.TypeOf<typeof storageClass>;
@@ -278,7 +284,7 @@ export const transition = t.interface({
 
 export type Transition = t.TypeOf<typeof transition>;
 
-export const lifecycleRule = t.interface({
+export const lifecycleRuleConfig = t.interface({
   abortIncompleteMultipartUpload: optional(t.number),
   enabled: optional(t.boolean),
   expiration: optional(t.number),
@@ -289,7 +295,13 @@ export const lifecycleRule = t.interface({
   transitions: optional(t.array(transition)),
 });
 
-export class LifecycleRule implements t.TypeOf<typeof lifecycleRule> {
+export const resourcePolicyStatement = t.interface({
+  policy: t.string,
+});
+
+export type ResourcePolicyStatement = t.TypeOf<typeof resourcePolicyStatement>;
+
+export class LifeCycleRule implements t.TypeOf<typeof lifecycleRuleConfig> {
   readonly abortIncompleteMultipartUpload: number = 1;
   readonly enabled: boolean = true;
   readonly expiration: number = 1825;
@@ -325,4 +337,171 @@ export const tag = t.interface({
 export class Tag implements t.TypeOf<typeof tag> {
   readonly key: string = '';
   readonly value: string = '';
+}
+
+export const cfnParameter = t.interface({
+  name: t.string,
+  value: t.string,
+});
+
+export class CfnParameter implements t.TypeOf<typeof cfnParameter> {
+  readonly name: string = '';
+  readonly value: string = '';
+}
+
+const trafficTypeEnum = enums(
+  'Flow LogTrafficType',
+  ['ALL', 'ACCEPT', 'REJECT'],
+  'Value should be a flow log traffic type',
+);
+
+export const logDestinationTypeEnum = enums(
+  'LogDestinationTypes',
+  ['s3', 'cloud-watch-logs'],
+  'Value should be a log destination type',
+);
+
+const vpcFlowLogsS3BucketConfig = t.interface({
+  lifecycleRules: optional(t.array(lifecycleRuleConfig)),
+});
+
+const vpcFlowLogsCloudWatchLogsConfig = t.interface({
+  retentionInDays: optional(t.number),
+  kms: optional(nonEmptyString),
+});
+
+const vpcFlowLogsDestinationConfig = t.interface({
+  s3: optional(vpcFlowLogsS3BucketConfig),
+  cloudWatchLogs: optional(vpcFlowLogsCloudWatchLogsConfig),
+});
+
+export const vpcFlowLogsConfig = t.interface({
+  trafficType: trafficTypeEnum,
+  maxAggregationInterval: t.number,
+  destinations: t.array(logDestinationTypeEnum),
+  destinationsConfig: optional(vpcFlowLogsDestinationConfig),
+  defaultFormat: t.boolean,
+  customFields: optional(t.array(nonEmptyString)),
+});
+
+/**
+ * VPC flow logs S3 destination bucket configuration.
+ */
+class VpcFlowLogsS3BucketConfig implements t.TypeOf<typeof vpcFlowLogsS3BucketConfig> {
+  /**
+   * @optional
+   * Flow log destination S3 bucket life cycle rules
+   */
+  readonly lifecycleRules: LifeCycleRule[] = [];
+}
+
+/**
+ * VPC flow logs CloudWatch logs destination configuration.
+ */
+class VpcFlowLogsCloudWatchLogsConfig implements t.TypeOf<typeof vpcFlowLogsCloudWatchLogsConfig> {
+  /**
+   * @optional
+   * CloudWatchLogs retention days
+   */
+  readonly retentionInDays = 3653;
+  /**
+   * @optional
+   * CloudWatchLogs encryption key name
+   */
+  readonly kms = undefined;
+}
+
+/**
+ * VPC flow logs destination configuration.
+ */
+class VpcFlowLogsDestinationConfig implements t.TypeOf<typeof vpcFlowLogsDestinationConfig> {
+  /**
+   * S3 Flow log destination configuration
+   * Use following configuration to enable S3 flow log destination
+   * @example
+   * ```
+   * destinations:
+   *     s3:
+   *       enable: true
+   *       lifecycleRules: []
+   * ```
+   */
+  readonly s3: VpcFlowLogsS3BucketConfig = new VpcFlowLogsS3BucketConfig();
+  /**
+   * CloudWatchLogs Flow log destination configuration
+   * Use following configuration to enable CloudWatchLogs flow log destination
+   * @example
+   * ```
+   * destinations:
+   *     cloudWatchLogs:
+   *       enable: true
+   *       retentionInDays: 3653
+   * ```
+   */
+  readonly cloudWatchLogs: VpcFlowLogsCloudWatchLogsConfig = new VpcFlowLogsCloudWatchLogsConfig();
+}
+
+/**
+ * VPC flow logs configuration.
+ * Used to customize VPC flow log output.
+ */
+export class VpcFlowLogsConfig implements t.TypeOf<typeof vpcFlowLogsConfig> {
+  /**
+   * The type of traffic to log.
+   *
+   * @see {@link trafficTypeEnum}
+   */
+  readonly trafficType = 'ALL';
+  /**
+   * The maximum log aggregation interval in days.
+   */
+  readonly maxAggregationInterval: number = 600;
+  /**
+   * An array of destination serviced for storing logs.
+   *
+   * @see {@link NetworkConfigTypes.logDestinationTypeEnum}
+   */
+  readonly destinations: t.TypeOf<typeof logDestinationTypeEnum>[] = ['s3', 'cloud-watch-logs'];
+  /**
+   * @optional
+   * VPC Flow log detonations properties. Use this property to specify S3 and CloudWatchLogs properties
+   * @see {@link VpcFlowLogsDestinationConfig}
+   */
+  readonly destinationsConfig: VpcFlowLogsDestinationConfig = new VpcFlowLogsDestinationConfig();
+  /**
+   * Enable to use the default log format for flow logs.
+   */
+  readonly defaultFormat = false;
+  /**
+   * Custom fields to include in flow log outputs.
+   */
+  readonly customFields = [
+    'version',
+    'account-id',
+    'interface-id',
+    'srcaddr',
+    'dstaddr',
+    'srcport',
+    'dstport',
+    'protocol',
+    'packets',
+    'bytes',
+    'start',
+    'end',
+    'action',
+    'log-status',
+    'vpc-id',
+    'subnet-id',
+    'instance-id',
+    'tcp-flags',
+    'type',
+    'pkt-srcaddr',
+    'pkt-dstaddr',
+    'region',
+    'az-id',
+    'pkt-src-aws-service',
+    'pkt-dst-aws-service',
+    'flow-direction',
+    'traffic-path',
+  ];
 }

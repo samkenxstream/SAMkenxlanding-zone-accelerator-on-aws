@@ -13,8 +13,12 @@
 
 export * from './lib/accounts-config';
 export * from './lib/common-types';
+export * from './lib/customizations-config';
 export * from './lib/global-config';
 export * from './lib/iam-config';
 export * from './lib/network-config';
 export * from './lib/organization-config';
 export * from './lib/security-config';
+export * from './validator/customizations-config-validator';
+export * from './validator/iam-config-validator';
+export * from './validator/network-config-validator/network-config-validator';

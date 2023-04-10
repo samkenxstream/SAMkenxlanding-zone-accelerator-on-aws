@@ -11,7 +11,7 @@
  *  and limitations under the License.
  */
 
-import { throttlingBackOff } from '@aws-accelerator/utils';
+import { delay, throttlingBackOff } from '@aws-accelerator/utils';
 import * as AWS from 'aws-sdk';
 AWS.config.logger = console;
 
@@ -30,8 +30,9 @@ export async function handler(event: AWSLambda.CloudFormationCustomResourceEvent
 > {
   const region = event.ResourceProperties['region'];
   const adminAccountId = event.ResourceProperties['adminAccountId'];
+  const solutionId = process.env['SOLUTION_ID'];
 
-  const guardDutyClient = new AWS.GuardDuty({ region: region });
+  const guardDutyClient = new AWS.GuardDuty({ region: region, customUserAgent: solutionId });
 
   const guardDutyAdminAccount = await isGuardDutyEnable(guardDutyClient, adminAccountId);
 
@@ -53,9 +54,22 @@ export async function handler(event: AWSLambda.CloudFormationCustomResourceEvent
         console.log(
           `Started enableOrganizationAdminAccount function in ${event.ResourceProperties['region']} region for account ${adminAccountId}`,
         );
-        await throttlingBackOff(() =>
-          guardDutyClient.enableOrganizationAdminAccount({ AdminAccountId: adminAccountId }).promise(),
-        );
+
+        let retries = 0;
+        while (retries < 10) {
+          await delay(retries ** 2 * 1000);
+          console.log('enable');
+          try {
+            await throttlingBackOff(() =>
+              guardDutyClient.enableOrganizationAdminAccount({ AdminAccountId: adminAccountId }).promise(),
+            );
+            console.log('command run');
+            break;
+          } catch (error) {
+            console.log(error);
+            retries = retries + 1;
+          }
+        }
       }
 
       return { Status: 'Success', StatusCode: 200 };
@@ -86,12 +100,14 @@ async function isGuardDutyEnable(
 ): Promise<{ accountId: string | undefined; status: string | undefined }> {
   const adminAccounts: AWS.GuardDuty.AdminAccount[] = [];
   let nextToken: string | undefined = undefined;
+  console.log('isenabled');
   do {
     const page = await throttlingBackOff(() =>
       guardDutyClient.listOrganizationAdminAccounts({ NextToken: nextToken }).promise(),
     );
     for (const account of page.AdminAccounts ?? []) {
       adminAccounts.push(account);
+      console.log(account);
     }
     nextToken = page.NextToken;
   } while (nextToken);

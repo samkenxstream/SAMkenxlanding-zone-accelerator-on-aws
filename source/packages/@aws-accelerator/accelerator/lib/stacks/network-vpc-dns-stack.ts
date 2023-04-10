@@ -14,42 +14,39 @@
 import * as cdk from 'aws-cdk-lib';
 import { pascalCase } from 'change-case';
 import { Construct } from 'constructs';
+import { NagSuppressions } from 'cdk-nag';
 
 import {
   AccountsConfig,
-  OrganizationConfig,
+  Region,
   ResolverEndpointConfig,
   ResolverRuleConfig,
   VpcConfig,
+  VpcTemplatesConfig,
 } from '@aws-accelerator/config';
-import { HostedZone, KeyLookup, RecordSet, ResolverRule, ResourceShare } from '@aws-accelerator/constructs';
+import { HostedZone, RecordSet, ResolverRule } from '@aws-accelerator/constructs';
 
-import { Logger } from '../logger';
 import { AcceleratorStack, AcceleratorStackProps } from './accelerator-stack';
-import { KeyStack } from './key-stack';
-
-type ResourceShareType = ResolverRuleConfig;
 
 export class NetworkVpcDnsStack extends AcceleratorStack {
-  private acceleratorKey: cdk.aws_kms.Key;
+  private cloudwatchKey: cdk.aws_kms.Key;
   private accountsConfig: AccountsConfig;
   private logRetention: number;
-  private orgConfig: OrganizationConfig;
 
   constructor(scope: Construct, id: string, props: AcceleratorStackProps) {
     super(scope, id, props);
-
     // Set private properties
     this.accountsConfig = props.accountsConfig;
     this.logRetention = props.globalConfig.cloudwatchLogRetentionInDays;
-    this.orgConfig = props.organizationConfig;
 
-    this.acceleratorKey = new KeyLookup(this, 'AcceleratorKeyLookup', {
-      accountId: props.accountsConfig.getAuditAccountId(),
-      roleName: KeyStack.CROSS_ACCOUNT_ACCESS_ROLE_NAME,
-      keyArnParameterName: KeyStack.ACCELERATOR_KEY_ARN_PARAMETER_NAME,
-      logRetentionInDays: props.globalConfig.cloudwatchLogRetentionInDays,
-    }).getKey();
+    this.cloudwatchKey = cdk.aws_kms.Key.fromKeyArn(
+      this,
+      'AcceleratorGetCloudWatchKey',
+      cdk.aws_ssm.StringParameter.valueForStringParameter(
+        this,
+        AcceleratorStack.ACCELERATOR_CLOUDWATCH_LOG_KEY_ARN_PARAMETER_NAME,
+      ),
+    ) as cdk.aws_kms.Key;
 
     //
     // Store VPC IDs, interface endpoint DNS, and Route 53 resolver endpoints
@@ -58,9 +55,11 @@ export class NetworkVpcDnsStack extends AcceleratorStack {
     const endpointMap = new Map<string, string>();
     const zoneMap = new Map<string, string>();
     const resolverMap = new Map<string, string>();
-    for (const vpcItem of props.networkConfig.vpcs ?? []) {
-      const accountId = this.accountsConfig.getAccountId(vpcItem.account);
-      if (accountId === cdk.Stack.of(this).account && vpcItem.region === cdk.Stack.of(this).region) {
+    for (const vpcItem of [...props.networkConfig.vpcs, ...(props.networkConfig.vpcTemplates ?? [])] ?? []) {
+      // Get account IDs
+      const vpcAccountIds = this.getVpcAccountIds(vpcItem);
+
+      if (vpcAccountIds.includes(cdk.Stack.of(this).account) && vpcItem.region === cdk.Stack.of(this).region) {
         // Set VPC ID
         const vpcId = cdk.aws_ssm.StringParameter.valueForStringParameter(
           this,
@@ -103,34 +102,58 @@ export class NetworkVpcDnsStack extends AcceleratorStack {
     //
     // Create private hosted zones
     //
-    for (const vpcItem of props.networkConfig.vpcs ?? []) {
-      const accountId = this.accountsConfig.getAccountId(vpcItem.account);
-      if (accountId === cdk.Stack.of(this).account && vpcItem.region === cdk.Stack.of(this).region) {
+
+    for (const vpcItem of [...props.networkConfig.vpcs, ...(props.networkConfig.vpcTemplates ?? [])] ?? []) {
+      // Get account IDs
+      const vpcAccountIds = this.getVpcAccountIds(vpcItem);
+
+      if (vpcAccountIds.includes(cdk.Stack.of(this).account) && vpcItem.region === cdk.Stack.of(this).region) {
         const vpcId = vpcMap.get(vpcItem.name);
 
         if (!vpcId) {
-          throw new Error(`[network-vpc-dns-stack] Unable to locate VPC ${vpcItem.name}`);
+          this.logger.error('Unable to locate VPC ${vpcItem.name}');
+          throw new Error(`Configuration validation failed at runtime.`);
         }
         // Create private hosted zones
-        if (vpcItem.interfaceEndpoints) {
+        if (vpcItem.interfaceEndpoints?.central) {
           this.createHostedZones(vpcItem, vpcId, endpointMap, zoneMap);
         }
 
         //
         // Create resolver rules
         //
+
+        // FORWARD rules
         if (props.networkConfig.centralNetworkServices?.route53Resolver?.endpoints) {
           const endpoints = props.networkConfig.centralNetworkServices?.route53Resolver?.endpoints;
 
           for (const endpointItem of endpoints) {
             if (endpointItem.vpc === vpcItem.name && endpointItem.type === 'OUTBOUND') {
-              this.createResolverRules(vpcItem, endpointItem, resolverMap);
+              this.createForwardRules(vpcItem, endpointItem, resolverMap);
             }
           }
         }
       }
     }
-    Logger.info('[network-vpc-dns-stack] Completed stack synthesis');
+
+    // SYSTEM rules
+    if (props.networkConfig.centralNetworkServices?.route53Resolver?.rules) {
+      const delegatedAdminAccountId = this.accountsConfig.getAccountId(
+        props.networkConfig.centralNetworkServices.delegatedAdminAccount,
+      );
+
+      // Only deploy in the delegated admin account
+      if (delegatedAdminAccountId === cdk.Stack.of(this).account) {
+        this.createSystemRules(props.networkConfig.centralNetworkServices?.route53Resolver?.rules);
+      }
+    }
+
+    //
+    // Create SSM Parameters
+    //
+    this.createSsmParameters();
+
+    this.logger.info('Completed stack synthesis');
   }
 
   /**
@@ -142,16 +165,14 @@ export class NetworkVpcDnsStack extends AcceleratorStack {
    * @param zoneMap
    */
   private createHostedZones(
-    vpcItem: VpcConfig,
+    vpcItem: VpcConfig | VpcTemplatesConfig,
     vpcId: string,
     endpointMap: Map<string, string>,
     zoneMap: Map<string, string>,
   ): void {
     for (const endpointItem of vpcItem.interfaceEndpoints?.endpoints ?? []) {
       // Create the private hosted zone
-      Logger.info(
-        `[network-vpc-dns-stack] Creating private hosted zone for VPC:${vpcItem.name} endpoint:${endpointItem.service}`,
-      );
+      this.logger.info(`Creating private hosted zone for VPC:${vpcItem.name} endpoint:${endpointItem.service}`);
       const hostedZoneName = HostedZone.getHostedZoneNameForService(endpointItem.service, cdk.Stack.of(this).region);
       const hostedZone = new HostedZone(
         this,
@@ -161,14 +182,11 @@ export class NetworkVpcDnsStack extends AcceleratorStack {
           vpcId,
         },
       );
-      new cdk.aws_ssm.StringParameter(
-        this,
-        `SsmParam${pascalCase(vpcItem.name)}Vpc${pascalCase(endpointItem.service)}EpHostedZone`,
-        {
-          parameterName: `/accelerator/network/vpc/${vpcItem.name}/route53/hostedZone/${endpointItem.service}/id`,
-          stringValue: hostedZone.hostedZoneId,
-        },
-      );
+      this.ssmParameters.push({
+        logicalId: `SsmParam${pascalCase(vpcItem.name)}Vpc${pascalCase(endpointItem.service)}EpHostedZone`,
+        parameterName: `/accelerator/network/vpc/${vpcItem.name}/route53/hostedZone/${endpointItem.service}/id`,
+        stringValue: hostedZone.hostedZoneId,
+      });
 
       // Create the record set
       let recordSetName = hostedZoneName;
@@ -182,19 +200,15 @@ export class NetworkVpcDnsStack extends AcceleratorStack {
       const dnsName = endpointMap.get(endpointKey);
       const zoneId = zoneMap.get(endpointKey);
       if (!dnsName) {
-        throw new Error(
-          `[network-vpc-dns-stack] Unable to locate DNS name for VPC:${vpcItem.name} endpoint:${endpointItem.service}`,
-        );
+        this.logger.error(`Unable to locate DNS name for VPC:${vpcItem.name} endpoint:${endpointItem.service}`);
+        throw new Error(`Configuration validation failed at runtime.`);
       }
       if (!zoneId) {
-        throw new Error(
-          `[network-vpc-dns-stack] Unable to locate hosted zone ID for VPC:${vpcItem.name} endpoint:${endpointItem.service}`,
-        );
+        this.logger.error(`Unable to locate hosted zone ID for VPC:${vpcItem.name} endpoint:${endpointItem.service}`);
+        throw new Error(`Configuration validation failed at runtime.`);
       }
 
-      Logger.info(
-        `[network-vpc-dns-stack] Creating alias record for VPC:${vpcItem.name} endpoint:${endpointItem.service}`,
-      );
+      this.logger.info(`Creating alias record for VPC:${vpcItem.name} endpoint:${endpointItem.service}`);
       new RecordSet(this, `${pascalCase(vpcItem.name)}Vpc${pascalCase(endpointItem.service)}EpRecordSet`, {
         type: 'A',
         name: recordSetName,
@@ -206,14 +220,14 @@ export class NetworkVpcDnsStack extends AcceleratorStack {
   }
 
   /**
-   * Create Route 53 resolver rules
+   * Create Route 53 resolver FORWARD rules
    *
    * @param vpcItem
    * @param endpointItem
    * @param resolverMap
    */
-  private createResolverRules(
-    vpcItem: VpcConfig,
+  private createForwardRules(
+    vpcItem: VpcConfig | VpcTemplatesConfig,
     endpointItem: ResolverEndpointConfig,
     resolverMap: Map<string, string>,
   ): void {
@@ -221,16 +235,13 @@ export class NetworkVpcDnsStack extends AcceleratorStack {
     const endpointKey = `${vpcItem.name}_${endpointItem.name}`;
     const endpointId = resolverMap.get(endpointKey);
     if (!endpointId) {
-      throw new Error(
-        `[network-vpc-dns-stack] Create resolver rule: unable to locate resolver endpoint ${endpointItem.name}`,
-      );
+      this.logger.error(`Create resolver rule: unable to locate resolver endpoint ${endpointItem.name}`);
+      throw new Error(`Configuration validation failed at runtime.`);
     }
 
     // Create rules
     for (const ruleItem of endpointItem.rules ?? []) {
-      Logger.info(
-        `[network-vpc-dns-stack] Add Route 53 Resolver rule ${ruleItem.name} to endpoint ${endpointItem.name}`,
-      );
+      this.logger.info(`Add Route 53 Resolver FORWARD rule ${ruleItem.name} to endpoint ${endpointItem.name}`);
 
       // Check whether there is an inbound endpoint target
       let inboundTarget: string | undefined = undefined;
@@ -238,9 +249,8 @@ export class NetworkVpcDnsStack extends AcceleratorStack {
         const targetKey = `${vpcItem.name}_${ruleItem.inboundEndpointTarget}`;
         inboundTarget = resolverMap.get(targetKey);
         if (!inboundTarget) {
-          throw new Error(
-            `[network-vpc-dns-stack] Target inbound endpoint: ${ruleItem.inboundEndpointTarget} not found in endpoint map`,
-          );
+          this.logger.error(`Target inbound endpoint: ${ruleItem.inboundEndpointTarget} not found in endpoint map`);
+          throw new Error(`Configuration validation failed at runtime.`);
         }
       }
 
@@ -251,58 +261,122 @@ export class NetworkVpcDnsStack extends AcceleratorStack {
         ruleType: ruleItem.ruleType,
         resolverEndpointId: endpointId,
         targetIps: ruleItem.targetIps,
-        tags: ruleItem.tags ?? [],
+        tags: ruleItem.tags,
         targetInbound: inboundTarget,
-        kmsKey: this.acceleratorKey,
+        kmsKey: this.cloudwatchKey,
         logRetentionInDays: this.logRetention,
       });
-      new cdk.aws_ssm.StringParameter(this, pascalCase(`SsmParam${ruleItem.name}ResolverRule`), {
+      this.ssmParameters.push({
+        logicalId: pascalCase(`SsmParam${ruleItem.name}ResolverRule`),
         parameterName: `/accelerator/network/route53Resolver/rules/${ruleItem.name}/id`,
         stringValue: rule.ruleId,
       });
 
+      // create role to be assumed by MAD account to update resolver rule
+      this.createManagedADResolverRuleUpdateRole(ruleItem.name, rule.ruleArn);
+
       if (ruleItem.shareTargets) {
-        Logger.info(`[network-vpc-dns-stack] Share Route 53 Resolver rule ${ruleItem.name}`);
+        this.logger.info(`Share Route 53 Resolver FORWARD rule ${ruleItem.name}`);
         this.addResourceShare(ruleItem, `${ruleItem.name}_ResolverRule`, [rule.ruleArn]);
       }
     }
   }
 
   /**
-   * Add RAM resource shares to the stack.
-   *
-   * @param item
-   * @param resourceShareName
-   * @param resourceArns
+   * Create IAM role to be assumed by MAD account to update resolver rule in central account
+   * @param ruleName
+   * @param ruleArn
+   * @returns
    */
-  private addResourceShare(item: ResourceShareType, resourceShareName: string, resourceArns: string[]): void {
-    // Build a list of principals to share to
-    const principals: string[] = [];
+  private createManagedADResolverRuleUpdateRole(ruleName: string, ruleArn: string) {
+    for (const managedActiveDirectory of this.props.iamConfig.managedActiveDirectories ?? []) {
+      const madAccountId = this.accountsConfig.getAccountId(managedActiveDirectory.account);
+      const delegatedAdminAccountId = this.accountsConfig.getAccountId(
+        this.props.networkConfig.centralNetworkServices!.delegatedAdminAccount,
+      );
 
-    // Loop through all the defined OUs
-    for (const ouItem of item.shareTargets?.organizationalUnits ?? []) {
-      let ouArn = this.orgConfig.getOrganizationalUnitArn(ouItem);
-      // AWS::RAM::ResourceShare expects the organizations ARN if
-      // sharing with the entire org (Root)
-      if (ouItem === 'Root') {
-        ouArn = ouArn.substring(0, ouArn.lastIndexOf('/')).replace('root', 'organization');
+      if (madAccountId === delegatedAdminAccountId) {
+        this.logger.info(
+          `Managed AD account is same as delegated admin account, skipping role creation for ${managedActiveDirectory.name} active directory}`,
+        );
+        return;
       }
-      Logger.info(`[network-vpc-dns-stack] Share ${resourceShareName} with Organizational Unit ${ouItem}: ${ouArn}`);
-      principals.push(ouArn);
-    }
+      if (
+        delegatedAdminAccountId === cdk.Stack.of(this).account &&
+        cdk.Stack.of(this).region === this.props.globalConfig.homeRegion &&
+        ruleName === managedActiveDirectory.resolverRuleName
+      ) {
+        this.logger.info(
+          `Create Managed AD resolver rule update role for ${managedActiveDirectory.name} active directory`,
+        );
+        new cdk.aws_iam.Role(this, pascalCase(`AWSAccelerator-MAD-${ruleName}`), {
+          roleName: `AWSAccelerator-MAD-${ruleName}`,
+          assumedBy: new cdk.aws_iam.PrincipalWithConditions(new cdk.aws_iam.AccountPrincipal(madAccountId), {
+            ArnLike: {
+              'aws:PrincipalARN': [`arn:${cdk.Stack.of(this).partition}:iam::${madAccountId}:role/AWSAccelerator-*`],
+            },
+          }),
+          inlinePolicies: {
+            default: new cdk.aws_iam.PolicyDocument({
+              statements: [
+                new cdk.aws_iam.PolicyStatement({
+                  effect: cdk.aws_iam.Effect.ALLOW,
+                  actions: ['route53resolver:ListResolverRules'],
+                  resources: ['*'],
+                }),
+                new cdk.aws_iam.PolicyStatement({
+                  effect: cdk.aws_iam.Effect.ALLOW,
+                  actions: ['route53resolver:UpdateResolverRule'],
+                  resources: [ruleArn],
+                }),
+              ],
+            }),
+          },
+        });
 
-    // Loop through all the defined accounts
-    for (const account of item.shareTargets?.accounts ?? []) {
-      const accountId = this.accountsConfig.getAccountId(account);
-      Logger.info(`[network-vpc-dns-stack] Share ${resourceShareName} with Account ${account}: ${accountId}`);
-      principals.push(accountId);
+        // AwsSolutions-IAM5: The IAM entity contains wildcard permissions
+        NagSuppressions.addResourceSuppressionsByPath(
+          this,
+          `${this.stackName}/` + pascalCase(`AWSAccelerator-MAD-${ruleName}`) + '/Resource',
+          [
+            {
+              id: 'AwsSolutions-IAM5',
+              reason: 'Role needs access to list resolver rules and update',
+            },
+          ],
+        );
+      }
     }
+  }
 
-    // Create the Resource Share
-    new ResourceShare(this, `${pascalCase(resourceShareName)}ResourceShare`, {
-      name: resourceShareName,
-      principals,
-      resourceArns: resourceArns,
-    });
+  /**
+   * Create Route 53 resolver SYSTEM rules
+   * @param rules
+   */
+  private createSystemRules(rules: ResolverRuleConfig[]): void {
+    // Process SYSTEM rules
+    for (const ruleItem of rules ?? []) {
+      // Only deploy if the region isn't excluded
+      if (!ruleItem.excludedRegions?.includes(cdk.Stack.of(this).region as Region) || !ruleItem.excludedRegions) {
+        this.logger.info(`Add Route 53 Resolver SYSTEM rule ${ruleItem.name}`);
+
+        const rule = new ResolverRule(this, `SystemResolverRule${pascalCase(ruleItem.name)}`, {
+          domainName: ruleItem.domainName,
+          name: ruleItem.name,
+          ruleType: ruleItem.ruleType ?? 'SYSTEM',
+          tags: ruleItem.tags,
+        });
+        this.ssmParameters.push({
+          logicalId: pascalCase(`SsmParam${ruleItem.name}ResolverRule`),
+          parameterName: `/accelerator/network/route53Resolver/rules/${ruleItem.name}/id`,
+          stringValue: rule.ruleId,
+        });
+
+        if (ruleItem.shareTargets) {
+          this.logger.info(`Share Route 53 Resolver SYSTEM rule ${ruleItem.name}`);
+          this.addResourceShare(ruleItem, `${ruleItem.name}_ResolverRule`, [rule.ruleArn]);
+        }
+      }
+    }
   }
 }

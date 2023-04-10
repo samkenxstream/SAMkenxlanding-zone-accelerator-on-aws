@@ -14,7 +14,7 @@
 import * as AWS from 'aws-sdk';
 import { throttlingBackOff } from '@aws-accelerator/utils';
 
-const organizationsClient = new AWS.Organizations();
+let organizationsClient: AWS.Organizations;
 
 /**
  * detach-quarantine-scp - lambda handler
@@ -32,7 +32,9 @@ export async function handler(event: AWSLambda.CloudFormationCustomResourceEvent
 > {
   console.log(event);
   const policyId: string = event.ResourceProperties['scpPolicyId'] ?? '';
+  const solutionId = process.env['SOLUTION_ID'];
 
+  organizationsClient = new AWS.Organizations({ customUserAgent: solutionId });
   switch (event.RequestType) {
     case 'Create':
     case 'Update':
@@ -82,7 +84,6 @@ async function detachQuarantineScp(accountId: string, policyId: string): Promise
     // eslint-disable-next-line @typescript-eslint/no-explicit-any
   } catch (e: any) {
     if (e.code === 'PolicyNotAttachedException') {
-      //console.log(`Quarantine SCP was not attached to account: ${accountId}`);
       return true;
     } else {
       console.log(e);

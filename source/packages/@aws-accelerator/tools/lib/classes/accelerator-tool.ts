@@ -10,22 +10,22 @@
  *  OR CONDITIONS OF ANY KIND, express or implied. See the License for the specific language governing permissions
  *  and limitations under the License.
  */
-import { AcceleratorStackNames } from '../../../accelerator/lib/accelerator';
-import { Logger } from '../../../accelerator/lib/logger';
-// import { AcceleratorStackNames, Logger } from '@aws-accelerator/accelerator';
-import { GlobalConfig } from '@aws-accelerator/config';
-import { throttlingBackOff } from '@aws-accelerator/utils';
+import * as fs from 'fs';
+import * as os from 'os';
+import * as path from 'path';
+import * as winston from 'winston';
 
+import { GlobalConfig, SecurityConfig } from '@aws-accelerator/config';
+import { createLogger, throttlingBackOff } from '@aws-accelerator/utils';
+import { BackupClient, DeleteBackupVaultCommand } from '@aws-sdk/client-backup';
 import {
   CloudFormationClient,
   DeleteStackCommand,
-  DeleteStackCommandOutput,
   DescribeStacksCommand,
   ListStackResourcesCommand,
   Stack,
+  StackStatus,
   UpdateTerminationProtectionCommand,
-  waitUntilStackDeleteComplete,
-  waitUntilStackUpdateComplete,
 } from '@aws-sdk/client-cloudformation';
 import { CloudWatchLogsClient, DeleteLogGroupCommand, DescribeLogGroupsCommand } from '@aws-sdk/client-cloudwatch-logs';
 import {
@@ -35,7 +35,9 @@ import {
   ListBuildsForProjectCommand,
 } from '@aws-sdk/client-codebuild';
 import { CodeCommitClient, DeleteRepositoryCommand, GetFileCommand } from '@aws-sdk/client-codecommit';
-import { CodePipelineClient, GetPipelineCommand } from '@aws-sdk/client-codepipeline';
+import { CodePipelineClient, GetPipelineCommand, StageDeclaration } from '@aws-sdk/client-codepipeline';
+import { DeleteRepositoryCommand as DeleteEcr, DescribeRepositoriesCommand, ECRClient } from '@aws-sdk/client-ecr';
+import { DetachRolePolicyCommand, IAMClient, ListAttachedRolePoliciesCommand } from '@aws-sdk/client-iam';
 import {
   DescribeKeyCommand,
   DisableKeyCommand,
@@ -49,31 +51,49 @@ import {
   DeleteObjectsCommand,
   ListBucketsCommand,
   ListObjectVersionsCommand,
+  ListObjectVersionsCommandOutput,
   S3Client,
 } from '@aws-sdk/client-s3';
-import { AssumeRoleCommand, Credentials, GetCallerIdentityCommand, STSClient } from '@aws-sdk/client-sts';
-import { WaiterResult } from '@aws-sdk/util-waiter';
-import { BackupClient, DeleteBackupVaultCommand } from '@aws-sdk/client-backup';
+import {
+  AssumeRoleCommand,
+  AssumeRoleCommandOutput,
+  Credentials,
+  GetCallerIdentityCommand,
+  STSClient,
+} from '@aws-sdk/client-sts';
 
 /**
  * Type for pipeline stage action information with order and action name
  */
-export type stageActionType = { order: number; name: string };
+type stageActionType = { order: number; name: string; stackPrefix: string };
 
 /**
  * Pipeline Stack Type
  */
-export type pipelineStackType = {
+type pipelineStackType = {
   stageOrder: number;
   order: number;
   stackName: string;
-  accountId: string;
+};
+
+type deleteStacksType = {
+  clients: {
+    cloudFormation: CloudFormationClient;
+    cloudWatchLogs: CloudWatchLogsClient;
+    s3: S3Client;
+    backup: BackupClient;
+    iam: IAMClient;
+    kms: KMSClient;
+  };
+  stackName: string;
+  accountID: string;
+  region: string;
 };
 
 /**
  * Pipeline Management Account Type, with account ID, role name to assume and sts credential
  */
-export type ManagementAccountType =
+type ManagementAccountType =
   | {
       accountId: string;
       assumeRoleName: string | undefined;
@@ -81,23 +101,20 @@ export type ManagementAccountType =
     }
   | undefined;
 
-type stackPersistentObjectListType = {
-  stackName: string;
-  resourceType: 'S3' | 'CWLogs' | 'KMS';
-  resourceClient: KMSClient | CloudWatchLogsClient | S3Client | BackupClient;
-  resourcePhysicalId: string;
-};
-
 /**
  * Accelerator AcceleratorToolProps
  */
 export interface AcceleratorToolProps {
   readonly installerStackName: string;
   readonly partition: string;
+  readonly fullDestroy: boolean;
+  readonly deleteAccelerator: boolean;
   readonly keepBootstraps: boolean;
-  readonly deleteData: boolean;
-  readonly deleteConfigRepo: boolean;
-  readonly deletePipelines: boolean;
+  readonly keepData: boolean;
+  readonly keepPipelineAndConfig: boolean;
+  readonly stageName: string;
+  readonly actionName: string;
+  readonly debug: boolean;
   readonly ignoreTerminationProtection: boolean;
 }
 
@@ -110,11 +127,24 @@ export class AcceleratorTool {
    * @private
    */
   private executingAccountId: string | undefined;
+
   /**
    * Pipeline Global Config
    * @private
    */
   private globalConfig: GlobalConfig | undefined;
+
+  /**
+   * Pipeline security Config
+   * @private
+   */
+  private securityConfig: SecurityConfig | undefined;
+
+  /**
+   * globalRegion
+   * @private
+   */
+  private globalRegion = 'us-east-1';
 
   /**
    * acceleratorToolProps
@@ -144,20 +174,110 @@ export class AcceleratorTool {
   }[] = [];
 
   /**
-   * multiActionStageActions
-   * @private
+   *
    */
-  private multiActionStageActions: stageActionType[] = [];
+  private deleteStackLists: deleteStacksType[] = [];
 
   /**
    * pipelineStageActions
+   * List Accelerator stacks in delete order
+   * Any changes in stacks creation in accelerator needs will need changes of this field
    * @private
    */
   private pipelineStageActions: {
     stage: string;
     order: number;
     actions: stageActionType[];
+  }[] = [
+    {
+      stage: 'Deploy',
+      order: 7,
+      actions: [
+        { order: 7, name: 'Finalize', stackPrefix: 'AWSAccelerator-FinalizeStack' },
+        { order: 6, name: 'Customizations', stackPrefix: 'AWSAccelerator-CustomizationsStack' },
+        { order: 5, name: 'Network_Associations', stackPrefix: 'AWSAccelerator-NetworkAssociationsStack' },
+        { order: 5, name: 'Network_Associations', stackPrefix: 'AWSAccelerator-NetworkAssociationsGwlbStack' },
+        { order: 2, name: 'Security_Resources', stackPrefix: 'AWSAccelerator-SecurityResourcesStack' },
+        { order: 4, name: 'Network_VPCs', stackPrefix: 'AWSAccelerator-NetworkVpcDnsStack' },
+        { order: 3, name: 'Network_VPCs', stackPrefix: 'AWSAccelerator-NetworkVpcEndpointsStack' },
+        { order: 2, name: 'Network_VPCs', stackPrefix: 'AWSAccelerator-NetworkVpcStack' },
+        { order: 1, name: 'Operations', stackPrefix: 'AWSAccelerator-OperationsStack' },
+        { order: 1, name: 'Security', stackPrefix: 'AWSAccelerator-SecurityStack' },
+        { order: 1, name: 'Network_Prepare', stackPrefix: 'AWSAccelerator-NetworkPrepStack' },
+      ],
+    },
+    {
+      stage: 'SecurityAudit',
+      order: 6,
+      actions: [{ order: 1, name: 'SecurityAudit', stackPrefix: 'AWSAccelerator-SecurityAuditStack' }],
+    },
+    {
+      stage: 'Organization',
+      order: 5,
+      actions: [{ order: 1, name: 'Organizations', stackPrefix: 'AWSAccelerator-OrganizationsStack' }],
+    },
+    {
+      stage: 'Logging',
+      order: 4,
+      actions: [
+        { order: 2, name: 'Logging', stackPrefix: 'AWSAccelerator-LoggingStack' },
+        { order: 1, name: 'Key', stackPrefix: 'AWSAccelerator-KeyStack' },
+      ],
+    },
+    {
+      stage: 'Accounts',
+      order: 3,
+      actions: [{ order: 1, name: 'Accounts', stackPrefix: 'AWSAccelerator-AccountsStack' }],
+    },
+    {
+      stage: 'Prepare',
+      order: 2,
+      actions: [{ order: 1, name: 'Prepare', stackPrefix: 'AWSAccelerator-PrepareStack' }],
+    },
+    {
+      stage: 'Bootstrap',
+      order: 1,
+      actions: [{ order: 1, name: 'Bootstrap', stackPrefix: 'AWSAccelerator-CDKToolkit' }],
+    },
+  ];
+
+  /**
+   * List of pipeline stage names
+   */
+  private pipelineStageNames: string[] = [];
+
+  /**
+   * List of pipeline action names
+   */
+  private pipelineActionNames: string[] = [];
+
+  /**
+   * List of Kms key will be used to delete post stack deletion
+   */
+  private kmsKeys: { client: KMSClient; stackName: string; key: string }[] = [];
+
+  /**
+   * List of backup vaults will be used to delete post stack deletion
+   */
+  private backupVaults: { client: BackupClient; stackName: string; backup: string }[] = [];
+
+  /**
+   * List of log groups will be used to delete post stack deletion
+   */
+  private logGroups: {
+    client: CloudWatchLogsClient;
+    stackName: string;
+    logGroup: string;
   }[] = [];
+  /**
+   * List of buckets will be used to delete post stack deletion
+   */
+  private buckets: { client: S3Client; stackName: string; bucket: string }[] = [];
+
+  /**
+   * List of IAM roles will be used to delete post stack deletion
+   */
+  private iamRoles: { client: IAMClient; stackName: string; roleName: string }[] = [];
 
   /**
    * pipelineManagementAccount
@@ -178,19 +298,15 @@ export class AcceleratorTool {
    * acceleratorCloudFormationStacks
    * @private
    */
-  private acceleratorCloudFormationStacks: {
-    stageOrder: number;
-    order: number;
-    stackName: string;
-    accountId: string;
-  }[] = [];
+  private acceleratorCloudFormationStacks: pipelineStackType[] = [];
 
   private acceleratorCodeBuildProjects: string[] = [];
 
-  private prepareStackPersistentObjectList: stackPersistentObjectListType[] = [];
+  private logger: winston.Logger;
 
   constructor(props: AcceleratorToolProps) {
     this.acceleratorToolProps = props;
+    this.logger = createLogger(['accelerator-tool']);
   }
 
   /**
@@ -208,6 +324,9 @@ export class AcceleratorTool {
    * The name of the installer cloudformation stack
    */
   public async uninstallAccelerator(installerStackName: string): Promise<boolean> {
+    // Set global region
+    this.setGlobalRegion();
+
     // Get executing account ID
     const response = await throttlingBackOff(() => new STSClient({}).send(new GetCallerIdentityCommand({})));
     this.executingAccountId = response.Account;
@@ -215,12 +334,12 @@ export class AcceleratorTool {
     // Get installer pipeline
     const installerPipeline = await AcceleratorTool.getPipelineNameFromCloudFormationStack(installerStackName);
     if (!installerPipeline.status) {
-      Logger.debug(`[accelerator-tool] ${installerPipeline.pipelineName}`);
+      this.debugLog(`${installerPipeline.pipelineName}`, 'info');
       return false;
     }
 
     const getPipelineNameResponse = await throttlingBackOff(() =>
-      new CodePipelineClient({}).send(new GetPipelineCommand({ name: installerPipeline!.pipelineName })),
+      new CodePipelineClient({}).send(new GetPipelineCommand({ name: installerPipeline.pipelineName })),
     );
 
     const installerCodeBuildProjectName =
@@ -232,14 +351,14 @@ export class AcceleratorTool {
 
     // Default assignments when no qualifier present
     let acceleratorQualifier = 'AWSAccelerator';
-    let acceleratorPipelineStackNamePrefix = 'AWSAccelerator-PipelineStack';
-    let acceleratorPipelineName = 'AWSAccelerator-Pipeline';
+    let testerPipelineConfigRepositoryName = 'aws-accelerator-test-config';
+
+    let acceleratorPipelineStackNamePrefix = `${acceleratorQualifier}-PipelineStack`;
+    let acceleratorPipelineName = `${acceleratorQualifier}-Pipeline`;
 
     // Accelerator tester configuration
-    let testerPipelineStackNamePrefix = 'AWSAccelerator-TesterPipelineStack';
-    let testerPipelineConfigRepositoryName = 'aws-accelerator-test-config';
-    let testerStackNamePrefix = 'AWSAccelerator-TesterStack';
-    // End of default assignments
+    let testerPipelineStackNamePrefix = `${acceleratorQualifier}-TesterPipelineStack`;
+    let testerStackNamePrefix = `${acceleratorQualifier}-TesterStack`;
 
     for (const envVariable of batchGetProjectsCommandResponse.projects![0].environment!.environmentVariables!) {
       if (envVariable.name === 'ACCELERATOR_QUALIFIER') {
@@ -254,41 +373,61 @@ export class AcceleratorTool {
     }
 
     //Delete accelerator target cloudformation stacks
-    await this.deleteAcceleratorTargetCloudFormationStacks(acceleratorPipelineName);
+    await this.deletePipelineCloudFormationStacks(acceleratorPipelineName);
 
-    await this.deletePrepareStackResources();
-
-    // return false;
-
-    // Installer and Tester stack resource cleanup takes place in pipeline or management account, so reset the credential settings
-    AcceleratorTool.resetCredentialEnvironment();
-
-    // Delete tester stack
-    await this.deleteTesterStack(testerStackNamePrefix);
-
-    // Delete tester pipeline stack
-    await this.deleteTesterPipelineStack(testerPipelineStackNamePrefix, testerPipelineConfigRepositoryName);
-
-    // Delete Accelerator Pipeline stack
-    await this.deleteAcceleratorPipelineStack(acceleratorPipelineStackNamePrefix);
-
-    //Delete Installer Stack
-    await this.deleteAcceleratorInstallerStack(installerStackName);
-
-    // Cleanup any remaining resources in all accounts, this is required because,
-    // during deletion of custom resources creates cloudwatch logs which is required to clean
-    // Only when full cleanup was intended this this cleanup should take place
-    if (this.acceleratorToolProps.ignoreTerminationProtection) {
-      await this.deleteAcceleratorRemainingResourcesInAllAccounts(acceleratorQualifier);
-    }
-
-    //TODO Delete bootstrap stack for management account home region after pipeline deleted only when pipeline management account is not used
-    // Delete bootstrap stack from home region for management or pipeline account as last step of cleanups
-    if (!this.acceleratorToolProps.keepBootstraps && !this.externalPipelineAccount.isUsed) {
+    // remaining cleanup is required when fullDestroy or deleteAccelerator option used
+    if (this.acceleratorToolProps.fullDestroy || this.acceleratorToolProps.deleteAccelerator) {
+      // Installer and Tester stack resource cleanup takes place in pipeline or management account, so reset the credential settings
       AcceleratorTool.resetCredentialEnvironment();
-      await this.deleteStack(new CloudFormationClient({}), 'AWSAccelerator-CDKToolkit');
+
+      // Delete tester stack
+      await this.deleteTesterStack(testerStackNamePrefix);
+
+      // Delete tester pipeline stack when keepPipelineAndConfig not used
+      if (!this.acceleratorToolProps.keepPipelineAndConfig) {
+        await this.deleteTesterPipelineStack(testerPipelineStackNamePrefix, testerPipelineConfigRepositoryName);
+      }
+
+      // Delete Accelerator Pipeline stack when keepPipelineAndConfig not used
+      if (!this.acceleratorToolProps.keepPipelineAndConfig) {
+        await this.deleteAcceleratorPipelineStack(acceleratorPipelineStackNamePrefix);
+      }
+
+      //
+      // Start of installer cleanup only when fullDestroy used
+
+      //Delete Installer Stack when fullDestroy used
+      if (this.acceleratorToolProps.fullDestroy) {
+        await this.deleteAcceleratorInstallerStack(installerStackName);
+
+        // Delete bootstrap stack only when pipeline not executed from external account
+        if (!this.externalPipelineAccount.isUsed) {
+          // AcceleratorTool.resetCredentialEnvironment();
+          await this.deleteStack(new CloudFormationClient({}), 'AWSAccelerator-CDKToolkit');
+        }
+        //start final resource cleanup, CWL logs are re-created post CFN stack deletion so these needs to be clean
+        await this.finalCleanup(acceleratorQualifier);
+      }
     }
     return true;
+  }
+
+  /**
+   *
+   * @param stsClient Function to assume role
+   * @param roleArn
+   * @returns
+   */
+  private async assumeRole(stsClient: STSClient, roleArn: string): Promise<AssumeRoleCommandOutput> {
+    return throttlingBackOff(() =>
+      stsClient.send(
+        new AssumeRoleCommand({
+          RoleArn: roleArn,
+          RoleSessionName: 'acceleratorAssumeRoleSession',
+          DurationSeconds: 3600,
+        }),
+      ),
+    );
   }
 
   /**
@@ -309,9 +448,9 @@ export class AcceleratorTool {
    * @param installerStackName
    * @private
    */
-  private async deleteAcceleratorInstallerStack(installerStackName: string): Promise<boolean> {
-    if (!this.acceleratorToolProps.deletePipelines) {
-      return true;
+  private async deleteAcceleratorInstallerStack(installerStackName: string): Promise<void> {
+    if (this.acceleratorToolProps.keepPipelineAndConfig) {
+      return;
     }
 
     const installerPipeline = await AcceleratorTool.getPipelineNameFromCloudFormationStack(installerStackName);
@@ -326,8 +465,6 @@ export class AcceleratorTool {
       }
     }
     await this.deleteStack(new CloudFormationClient({}), installerStackName);
-
-    return true;
   }
 
   /**
@@ -335,55 +472,11 @@ export class AcceleratorTool {
    * @param pipelineName
    * @private
    */
-  private async deleteAcceleratorTargetCloudFormationStacks(pipelineName: string): Promise<boolean> {
-    if (await this.initPipeline(pipelineName)) {
-      const groupBy = (array: pipelineStackType[], key1: string, key2: string) => {
-        return array.reduce((accumulator, currentValue) => {
-          // @ts-ignore
-          if (!accumulator[currentValue[key1] + '' + currentValue[key2]]) {
-            // @ts-ignore
-            accumulator[currentValue[key1] + '' + currentValue[key2]] = [];
-          }
-          // @ts-ignore
-          accumulator[currentValue[key1] + '' + currentValue[key2]].push({
-            accountId: currentValue.accountId,
-            stackName: currentValue.stackName,
-          });
-          return accumulator;
-        }, {});
-      };
-      const stacksGroupByAccounts = groupBy(this.acceleratorCloudFormationStacks, 'stageOrder', 'order');
+  private async deletePipelineCloudFormationStacks(pipelineName: string): Promise<void> {
+    await this.initPipeline(pipelineName);
 
-      let pipelineStacksInDeleteOrder: {
-        deleteOrder: number;
-        displayOrderString: string;
-        resourceDetails: [{ accountId: string; stackName: string }];
-      }[] = [];
-
-      for (const [key, value] of Object.entries(stacksGroupByAccounts)) {
-        pipelineStacksInDeleteOrder.push({
-          deleteOrder: parseInt(key),
-          displayOrderString: [...key].map(Number).join('.'),
-          resourceDetails: value as [{ accountId: string; stackName: string }],
-        });
-      }
-
-      // Sort it descending to create delete stack commands
-      pipelineStacksInDeleteOrder = pipelineStacksInDeleteOrder.sort((first, second) =>
-        0 - first.deleteOrder > second.deleteOrder ? 1 : -1,
-      );
-
-      for (const accountStack of pipelineStacksInDeleteOrder) {
-        Logger.info(`[accelerator-tool] >>>>> Step - ${accountStack.displayOrderString} deletion started`);
-        if (!(await this.deleteStacks(accountStack))) {
-          return false;
-        }
-        Logger.info(`[accelerator-tool] >>>>> Step - ${accountStack.displayOrderString} deletion completed`);
-        Logger.info('');
-      }
-      return true;
-    } else {
-      return false;
+    for (const stack of this.acceleratorCloudFormationStacks) {
+      await this.deleteStacks(stack.stackName);
     }
   }
 
@@ -391,122 +484,45 @@ export class AcceleratorTool {
    * Private async function to initialize required properties to perform accelerator cleanup
    * @private
    */
-  private async initPipeline(pipelineName: string): Promise<boolean> {
+  private async initPipeline(pipelineName: string): Promise<void> {
     try {
       const response = await throttlingBackOff(() =>
         new CodePipelineClient({}).send(new GetPipelineCommand({ name: pipelineName })),
       );
 
-      let orderCounter = 0;
-      for (const stage of response.pipeline!.stages!) {
+      for (const stage of response.pipeline!.stages ?? []) {
+        // Create list of stage names to be used for stage filter when input stage name is given
+        this.pipelineStageNames.push(stage.name!.toLowerCase());
+
         // maintain list of code build project for the accelerator pipeline
-        for (const action of stage.actions!) {
-          if (
-            action.configuration!['ProjectName'] &&
-            !this.acceleratorCodeBuildProjects.find(item => item === action.configuration!['ProjectName'])
-          ) {
-            this.acceleratorCodeBuildProjects.push(action.configuration!['ProjectName']);
-          }
-        }
+        this.getCodebuildProjects(stage);
 
         // Get the source repo names
-        if (stage.name === 'Source') {
-          for (const action of stage.actions!) {
-            switch (action.name!) {
-              case 'Configuration':
-                this.pipelineConfigSourceRepo = {
-                  repositoryName: action.configuration!['RepositoryName'],
-                  branch: action.configuration!['BranchName'],
-                  provider: action.actionTypeId!.provider!,
-                };
-                break;
-            }
-          }
-        }
+        this.getPipelineRepos(stage);
+
+        // Get pipeline action names
+        this.getPipelineActionNames(stage);
+
         // Get bootstrap environment variables
-        if (stage.name === 'Bootstrap') {
-          this.bootstrapBuildEnvironmentVariables = await this.getCodeBuildEnvironmentVariables(
-            stage.actions![0].configuration!['ProjectName'],
-          );
-        }
-
-        // Get Accelerator stage actions
-        if (stage.name !== 'Source' && stage.name !== 'Build' && stage.name !== 'Review') {
-          if (stage.actions!.length > 1) {
-            for (const action of stage.actions!) {
-              const environmentVariableJson = Object.values(
-                JSON.parse(action.configuration!['EnvironmentVariables']),
-              )[0];
-
-              const environmentDeployCommand = environmentVariableJson as {
-                name: string;
-                type: string;
-                value: string;
-              };
-
-              const stackName = AcceleratorStackNames[environmentDeployCommand.value.split(' ')[2]];
-              this.multiActionStageActions.push({
-                order: action.runOrder!,
-                name: stackName,
-              });
-            }
-
-            // Sort it descending to create delete stack commands
-            this.multiActionStageActions = this.multiActionStageActions.sort((first, second) =>
-              0 - first.order > second.order ? 1 : -1,
-            );
-
-            this.pipelineStageActions.push({
-              stage: stage.name!,
-              order: (orderCounter += 1),
-              actions: this.multiActionStageActions,
-            });
-          } else {
-            for (const action of stage.actions!) {
-              const environmentVariableJson = Object.values(
-                JSON.parse(action.configuration!['EnvironmentVariables']),
-              )[0];
-              const environmentDeployCommand = environmentVariableJson as {
-                name: string;
-                type: string;
-                value: string;
-              };
-
-              let stackName: string | undefined;
-              if (environmentDeployCommand.value.split(' ')[0] === 'bootstrap') {
-                if (this.acceleratorToolProps.keepBootstraps) {
-                  stackName = undefined;
-                } else {
-                  stackName = 'AWSAccelerator-CDKToolkit';
-                }
-              } else {
-                stackName = AcceleratorStackNames[environmentDeployCommand.value.split(' ')[2]];
-              }
-
-              if (stackName) {
-                this.pipelineStageActions.push({
-                  stage: stage.name!,
-                  order: (orderCounter += 1),
-                  actions: [
-                    {
-                      order: 1,
-                      name: stackName,
-                    },
-                  ],
-                });
-              }
-            }
-          }
-        }
+        await this.getBootstrapEnvVariables(stage);
       }
 
-      // Sort it descending to create delete stack commands
-      this.pipelineStageActions = this.pipelineStageActions.sort((first, second) =>
-        0 - first.order > second.order ? 1 : -1,
-      );
+      //
+      // Filter the stages to be destroy based on input stage name
+      try {
+        this.filterPipelineStages();
+      } catch (
+        // eslint-disable-next-line @typescript-eslint/no-explicit-any
+        e: any
+      ) {
+        throw new Error(e);
+      }
 
       // Get Pipeline Global config
       this.globalConfig = await this.getGlobalConfig();
+
+      // Get Pipeline Security config
+      this.securityConfig = await this.getSecurityConfig();
 
       // Set pipeline management account details
       this.pipelineManagementAccount = await this.getPipelineManagementAccount();
@@ -516,14 +532,15 @@ export class AcceleratorTool {
 
       // Order the stacks in delete order
       this.acceleratorCloudFormationStacks = this.getPipelineCloudFormationStacks();
-
-      // console.log(this.acceleratorCloudFormationStacks);
-      // process.exit(1);
-
-      return true;
-    } catch (e) {
-      console.log(e);
-      return false;
+    } catch (
+      // eslint-disable-next-line @typescript-eslint/no-explicit-any
+      e: any
+    ) {
+      if (e.name === 'PipelineNotFoundException') {
+        throw new Error(`Pipeline ${pipelineName} not found!!!`);
+      } else {
+        throw new Error(e);
+      }
     }
   }
 
@@ -532,10 +549,7 @@ export class AcceleratorTool {
    * @param acceleratorPipelineStackNamePrefix
    * @private
    */
-  private async deleteAcceleratorPipelineStack(acceleratorPipelineStackNamePrefix: string): Promise<boolean> {
-    if (!this.acceleratorToolProps.deletePipelines) {
-      return true;
-    }
+  private async deleteAcceleratorPipelineStack(acceleratorPipelineStackNamePrefix: string): Promise<void> {
     const acceleratorPipelineStackName = `${acceleratorPipelineStackNamePrefix}-${
       this.externalPipelineAccount.isUsed
         ? this.externalPipelineAccount.accountId!
@@ -546,13 +560,14 @@ export class AcceleratorTool {
       acceleratorPipelineStackName,
     );
 
-    if (acceleratorPipeline.status) {
-      if (this.acceleratorToolProps.deleteConfigRepo) {
-        await this.deleteCodecommitRepository(
-          new CodeCommitClient({}),
-          `${this.pipelineConfigSourceRepo?.repositoryName}`,
-        );
-      }
+    if (
+      acceleratorPipeline.status &&
+      (await AcceleratorTool.isConfigRepositoryCreatedByAccelerator(acceleratorPipelineStackName))
+    ) {
+      await this.deleteCodecommitRepository(
+        new CodeCommitClient({}),
+        `${this.pipelineConfigSourceRepo?.repositoryName}`,
+      );
 
       const codeBuildClient = new CodeBuildClient({});
       const response = await throttlingBackOff(() =>
@@ -564,8 +579,6 @@ export class AcceleratorTool {
     }
 
     await this.deleteStack(new CloudFormationClient({}), acceleratorPipelineStackName);
-
-    return true;
   }
 
   /**
@@ -609,7 +622,7 @@ export class AcceleratorTool {
 
     if (this.executingAccountId !== managementAccountId && managementAccountId && managementAccountRoleName) {
       managementAccountCredentials = await this.getManagementAccountCredentials(
-        managementAccountId!,
+        managementAccountId,
         managementAccountRoleName,
       );
       this.externalPipelineAccount = { isUsed: true, accountId: this.executingAccountId! };
@@ -672,17 +685,29 @@ export class AcceleratorTool {
 
     for (const stage of this.pipelineStageActions) {
       for (const action of stage.actions) {
-        for (const account of this.organizationAccounts) {
-          pipelineCloudFormationStacks.push({
-            stageOrder: stage.order,
-            order: action.order,
-            accountId: account.accountId,
-            stackName: action.name,
-          });
-        }
+        // for (const account of this.organizationAccounts) {
+        pipelineCloudFormationStacks.push({
+          stageOrder: stage.order,
+          order: action.order,
+          stackName: action.stackPrefix,
+        });
+        // }
       }
     }
     return pipelineCloudFormationStacks;
+  }
+
+  private async getListObjectVersions(
+    s3Client: S3Client,
+    bucketName: string,
+  ): Promise<ListObjectVersionsCommandOutput> {
+    return throttlingBackOff(() =>
+      s3Client.send(
+        new ListObjectVersionsCommand({
+          Bucket: bucketName,
+        }),
+      ),
+    );
   }
 
   /**
@@ -703,17 +728,7 @@ export class AcceleratorTool {
 
     const stsClient = new STSClient({});
 
-    // Logger.info(`[accelerator-tool] management account roleArn => ${roleArn}`);
-
-    const assumeRoleCredential = await throttlingBackOff(() =>
-      stsClient.send(
-        new AssumeRoleCommand({
-          RoleArn: roleArn,
-          RoleSessionName: 'acceleratorAssumeRoleSession',
-          DurationSeconds: 3600,
-        }),
-      ),
-    );
+    const assumeRoleCredential = await this.assumeRole(stsClient, roleArn);
 
     process.env['AWS_ACCESS_KEY_ID'] = assumeRoleCredential.Credentials!.AccessKeyId!;
     process.env['AWS_ACCESS_KEY'] = assumeRoleCredential.Credentials!.AccessKeyId!;
@@ -727,74 +742,6 @@ export class AcceleratorTool {
   }
 
   /**
-   * Function to clean remaining resources from all accounts, this is because custom resource creates cloudwatch log group during delete events.
-   * Which is not deleted by the cloudformation stack
-   * @param installerQualifier
-   * @private
-   */
-  private async deleteAcceleratorRemainingResourcesInAllAccounts(installerQualifier: string): Promise<boolean> {
-    if (this.pipelineManagementAccount!.credentials) {
-      process.env['AWS_ACCESS_KEY_ID'] = this.pipelineManagementAccount!.credentials.AccessKeyId!;
-      process.env['AWS_ACCESS_KEY'] = this.pipelineManagementAccount!.credentials.AccessKeyId!;
-      process.env['AWS_SECRET_KEY'] = this.pipelineManagementAccount!.credentials.SecretAccessKey!;
-      process.env['AWS_SECRET_ACCESS_KEY'] = this.pipelineManagementAccount!.credentials.SecretAccessKey!;
-      process.env['AWS_SESSION_TOKEN'] = this.pipelineManagementAccount!.credentials.SessionToken;
-    }
-
-    const assumeRoleName = 'AWSControlTowerExecution';
-    let cloudWatchLogsClient: CloudWatchLogsClient;
-    for (const region of this.globalConfig!.enabledRegions) {
-      for (const account of this.organizationAccounts) {
-        if (account.accountId !== this.pipelineManagementAccount!.accountId) {
-          const roleArn = `arn:${this.acceleratorToolProps.partition}:iam::${account.accountId}:role/${assumeRoleName}`;
-          const stsClient = new STSClient({ region: region });
-          const assumeRoleCredential = await throttlingBackOff(() =>
-            stsClient.send(
-              new AssumeRoleCommand({
-                RoleArn: roleArn,
-                RoleSessionName: 'acceleratorAssumeRoleSession',
-              }),
-            ),
-          );
-          cloudWatchLogsClient = new CloudWatchLogsClient({
-            region: region,
-            credentials: {
-              accessKeyId: assumeRoleCredential.Credentials!.AccessKeyId!,
-              secretAccessKey: assumeRoleCredential.Credentials!.SecretAccessKey!,
-              sessionToken: assumeRoleCredential.Credentials!.SessionToken,
-              expiration: assumeRoleCredential.Credentials!.Expiration,
-            },
-          });
-        } else {
-          cloudWatchLogsClient = new CloudWatchLogsClient({ region: region });
-        }
-
-        // Clean all accelerator related cloud watch log groups
-        let nextToken: string | undefined = undefined;
-        do {
-          const page = await throttlingBackOff(() =>
-            cloudWatchLogsClient.send(new DescribeLogGroupsCommand({ nextToken })),
-          );
-          for (const logGroup of page.logGroups!) {
-            if (
-              logGroup.logGroupName?.includes('/aws/lambda/AWSAccelerator') ||
-              // logGroup.logGroupName?.includes('/aws/lambda/Accelerator') ||
-              logGroup.logGroupName?.includes(`/aws/codebuild/${installerQualifier}`)
-            ) {
-              Logger.info(`[accelerator-tool] Deleting log group ${logGroup.logGroupName}`);
-              await throttlingBackOff(() =>
-                cloudWatchLogsClient.send(new DeleteLogGroupCommand({ logGroupName: logGroup.logGroupName })),
-              );
-            }
-          }
-          nextToken = page.nextToken;
-        } while (nextToken);
-      }
-    }
-    return true;
-  }
-
-  /**
    * Function to get GlobalConfig object from the repo content
    * @private
    */
@@ -803,16 +750,54 @@ export class AcceleratorTool {
     const response = await throttlingBackOff(() =>
       codeCommitClient.send(
         new GetFileCommand({
-          repositoryName: this.pipelineConfigSourceRepo!.repositoryName!,
+          repositoryName: this.pipelineConfigSourceRepo!.repositoryName,
           filePath: 'global-config.yaml',
         }),
       ),
     );
-    const globalConfig = GlobalConfig.loadFromString(new TextDecoder('utf-8').decode(response.fileContent!));
-    if (!globalConfig) {
-      Logger.warn('[accelerator-tool] Error parsing global-config file, object undefined');
+
+    const tempDirPath = fs.mkdtempSync(path.join(os.tmpdir(), 'accel-config'));
+    fs.writeFileSync(path.join(tempDirPath, 'global-config.yaml'), response.fileContent!, 'utf8');
+    return GlobalConfig.load(tempDirPath);
+  }
+
+  /**
+   * Function to get SecurityConfig object from the repo content
+   * @private
+   */
+  private async getSecurityConfig(): Promise<SecurityConfig> {
+    const codeCommitClient = new CodeCommitClient({});
+    const response = await throttlingBackOff(() =>
+      codeCommitClient.send(
+        new GetFileCommand({
+          repositoryName: this.pipelineConfigSourceRepo!.repositoryName,
+          filePath: 'security-config.yaml',
+        }),
+      ),
+    );
+
+    const tempDirPath = fs.mkdtempSync(path.join(os.tmpdir(), 'accel-config'));
+    fs.writeFileSync(path.join(tempDirPath, 'security-config.yaml'), response.fileContent!, 'utf8');
+    return SecurityConfig.load(tempDirPath);
+  }
+
+  /**
+   * Function to get list of managed policies which are assigned to IAM roles by SSM automation accelerator-ec2-instance-profile-permission
+   * @returns
+   */
+  private getSsmManagedPolicies(): string[] {
+    for (const ruleSet of this.securityConfig!.awsConfig.ruleSets ?? []) {
+      for (const rule of ruleSet.rules) {
+        if (rule.name.toString() === 'accelerator-ec2-instance-profile-permission') {
+          for (const [key, value] of Object.entries(rule.inputParameters)) {
+            if (key === 'AWSManagedPolicies') {
+              return (value as string).split(',');
+            }
+          }
+        }
+      }
     }
-    return globalConfig!;
+    return [];
   }
 
   /**
@@ -824,60 +809,59 @@ export class AcceleratorTool {
    */
   private async deleteBucket(s3Client: S3Client, stackName: string, bucketName: string): Promise<boolean> {
     // List object and Delete objects
-    let listObjectVersionsResponse = await throttlingBackOff(() =>
-      s3Client.send(
-        new ListObjectVersionsCommand({
-          Bucket: bucketName,
-        }),
-      ),
-    );
-    let contents = [
-      ...(listObjectVersionsResponse.Versions ?? []),
-      ...(listObjectVersionsResponse.DeleteMarkers ?? []),
-    ];
-    while (contents.length > 0) {
-      Logger.info(`[accelerator-tool] Number of objects in ${bucketName} is ${contents.length} will be deleted`);
-      // eslint-disable-next-line  @typescript-eslint/no-explicit-any
-      const records = contents.map((record: any) => ({
-        Key: record.Key,
-        VersionId: record.VersionId,
-      }));
-      Logger.info(`[accelerator-tool] Deleting objects from bucket ${bucketName} from ${stackName} stack`);
+    try {
+      let listObjectVersionsResponse = await this.getListObjectVersions(s3Client, bucketName);
+      let contents = [
+        ...(listObjectVersionsResponse.Versions ?? []),
+        ...(listObjectVersionsResponse.DeleteMarkers ?? []),
+      ];
+      while (contents.length > 0) {
+        this.debugLog(`Number of objects in ${bucketName} is ${contents.length} will be deleted`, 'info');
+        // eslint-disable-next-line  @typescript-eslint/no-explicit-any
+        const records = contents.map((record: any) => ({
+          Key: record.Key,
+          VersionId: record.VersionId,
+        }));
+        this.debugLog(`Deleting objects from bucket ${bucketName} from ${stackName} stack`, 'info');
+        await throttlingBackOff(() =>
+          s3Client.send(
+            new DeleteObjectsCommand({
+              Bucket: bucketName,
+              Delete: { Objects: records },
+            }),
+          ),
+        );
+
+        // Wait before checking again for data
+        await this.delay(1000);
+
+        listObjectVersionsResponse = await this.getListObjectVersions(s3Client, bucketName);
+
+        contents = [
+          ...(listObjectVersionsResponse.Versions ?? []),
+          ...(listObjectVersionsResponse.DeleteMarkers ?? []),
+        ];
+
+        this.debugLog(`Number of objects in ${bucketName} is ${contents.length}, remaining to delete`, 'info');
+      }
+
+      // Delete the empty Bucket
+      this.debugLog(`Deleting empty bucket ${bucketName} from ${stackName} stack`, 'info');
       await throttlingBackOff(() =>
         s3Client.send(
-          new DeleteObjectsCommand({
-            Bucket: bucketName,
-            Delete: { Objects: records },
-          }),
-        ),
-      );
-
-      // Wait before checking again for data
-      await new Promise(func => setTimeout(func, 1000));
-
-      listObjectVersionsResponse = await throttlingBackOff(() =>
-        s3Client.send(
-          new ListObjectVersionsCommand({
+          new DeleteBucketCommand({
             Bucket: bucketName,
           }),
         ),
       );
-
-      contents = [...(listObjectVersionsResponse.Versions ?? []), ...(listObjectVersionsResponse.DeleteMarkers ?? [])];
-
-      Logger.info(`[accelerator-tool] Number of objects in ${bucketName} is ${contents.length}, remaining to delete`);
+    } catch (
+      // eslint-disable-next-line @typescript-eslint/no-explicit-any
+      e: any
+    ) {
+      if (e.name === 'NoSuchBucket') {
+        return true;
+      }
     }
-
-    // Delete the empty Bucket
-    Logger.info(`[accelerator-tool] Deleting empty bucket ${bucketName} from ${stackName} stack`);
-    await throttlingBackOff(() =>
-      s3Client.send(
-        new DeleteBucketCommand({
-          Bucket: bucketName,
-        }),
-      ),
-    );
-
     return true;
   }
 
@@ -893,18 +877,55 @@ export class AcceleratorTool {
     stackName: string,
     logGroupName: string,
   ): Promise<boolean> {
-    Logger.info(`[accelerator-tool] Deleting Cloudwatch Log group ${logGroupName} from ${stackName} stack`);
-
+    this.debugLog(`Deleting Cloudwatch Log group ${logGroupName} from ${stackName} stack`, 'info');
     try {
       await throttlingBackOff(() =>
         cloudWatchLogsClient.send(new DeleteLogGroupCommand({ logGroupName: logGroupName })),
       );
     } catch (ResourceNotFoundException) {
-      Logger.warn(
-        `[accelerator-tool] Cloudwatch Log group delete Error Log Group NOT FOUND ${logGroupName} from ${stackName} stack`,
+      this.debugLog(
+        `Cloudwatch Log group delete Error Log Group NOT FOUND ${logGroupName} from ${stackName} stack`,
+        'info',
       );
     }
     return true;
+  }
+
+  private async deleteIamRolePolicy(): Promise<void> {
+    for (const item of this.iamRoles) {
+      // this.debugLog(`Deleting IAM Role ${item.roleName} from ${item.stackName} stack`, 'info');
+      try {
+        // Remove managed policies
+        const listAttachedRolePoliciesResponse = await throttlingBackOff(() =>
+          item.client.send(new ListAttachedRolePoliciesCommand({ RoleName: item.roleName })),
+        );
+
+        for (const policy of listAttachedRolePoliciesResponse.AttachedPolicies!) {
+          if (
+            this.getSsmManagedPolicies().indexOf(policy.PolicyName!) !== -1
+            // policy.PolicyName === 'AmazonSSMManagedInstanceCore' ||
+            // policy.PolicyName === 'AmazonSSMDirectoryServiceAccess' ||
+            // policy.PolicyName === 'CloudWatchAgentServerPolicy'
+          ) {
+            this.debugLog(
+              `Managed policy ${policy.PolicyName} detached from IAM Role ${item.roleName} from ${item.stackName}`,
+              'info',
+            );
+            await throttlingBackOff(() =>
+              item.client.send(new DetachRolePolicyCommand({ RoleName: item.roleName, PolicyArn: policy.PolicyArn })),
+            );
+          }
+        }
+      } catch (
+        // eslint-disable-next-line @typescript-eslint/no-explicit-any
+        e: any
+      ) {
+        if (e.name === 'NoSuchEntity') {
+          this.debugLog(`IAM Role ${item.roleName} from ${item.stackName} stack not found !!`, 'info');
+        }
+      }
+    }
+    this.iamRoles = [];
   }
 
   /**
@@ -919,14 +940,14 @@ export class AcceleratorTool {
     stackName: string,
     backupVaultName: string,
   ): Promise<boolean> {
-    Logger.info(`[accelerator-tool] Deleting BackupVault ${backupVaultName} from ${stackName} stack`);
+    this.debugLog(`Deleting BackupVault ${backupVaultName} from ${stackName} stack`, 'info');
 
     try {
       await throttlingBackOff(() =>
         backupClient.send(new DeleteBackupVaultCommand({ BackupVaultName: backupVaultName })),
       );
     } catch (ResourceNotFoundException) {
-      Logger.warn(`[accelerator-tool] AWS BackupVault NOT FOUND ${backupVaultName} from ${stackName} stack`);
+      this.debugLog(`AWS BackupVault NOT FOUND ${backupVaultName} from ${stackName} stack`, 'debug');
     }
     return true;
   }
@@ -939,23 +960,37 @@ export class AcceleratorTool {
    * @private
    */
   private async scheduleKeyDeletion(kMSClient: KMSClient, stackName: string, kmsKeyId: string): Promise<boolean> {
-    Logger.info(`[accelerator-tool] Disabling KMS Key ${kmsKeyId} from ${stackName} stack`);
+    this.debugLog(`Disabling KMS Key ${kmsKeyId} from ${stackName} stack`, 'info');
     const keyStatus = await throttlingBackOff(() => kMSClient.send(new DescribeKeyCommand({ KeyId: kmsKeyId })));
     if (keyStatus.KeyMetadata?.KeyState === KeyState.Enabled) {
-      await throttlingBackOff(() => kMSClient.send(new DisableKeyCommand({ KeyId: kmsKeyId })));
-
-      Logger.info(`[accelerator-tool] Schedule KMS Key deletion ${kmsKeyId} from ${stackName} stack`);
-      await throttlingBackOff(() =>
-        kMSClient.send(
-          new ScheduleKeyDeletionCommand({
-            KeyId: kmsKeyId,
-            PendingWindowInDays: 7,
-          }),
-        ),
-      );
+      try {
+        await throttlingBackOff(() => kMSClient.send(new DisableKeyCommand({ KeyId: kmsKeyId })));
+        this.debugLog(`Schedule KMS Key deletion ${kmsKeyId} from ${stackName} stack`, 'info');
+        await throttlingBackOff(() =>
+          kMSClient.send(
+            new ScheduleKeyDeletionCommand({
+              KeyId: kmsKeyId,
+              PendingWindowInDays: 7,
+            }),
+          ),
+        );
+      } catch (
+        // eslint-disable-next-line @typescript-eslint/no-explicit-any
+        e: any
+      ) {
+        if (e.name === 'KMSInvalidStateException') {
+          // This is needed because session manager key is deleted with stack
+          this.debugLog(
+            '`KMS Key ${kmsKeyId} from ${stackName} stack in ${keyStatus.KeyMetadata?.KeyState} status, can not schedule deletion`',
+            'info',
+          );
+          return true;
+        }
+      }
     } else {
-      Logger.warn(
-        `[accelerator-tool] KMS Key ${kmsKeyId} from ${stackName} stack in ${keyStatus.KeyMetadata?.KeyState} status, can not schedule deletion`,
+      this.debugLog(
+        `KMS Key ${kmsKeyId} from ${stackName} stack in ${keyStatus.KeyMetadata?.KeyState} status, can not schedule deletion`,
+        'info',
       );
     }
     return true;
@@ -990,71 +1025,49 @@ export class AcceleratorTool {
   }
 
   /**
-   * Function to delete stack's resources like S3/Cloudwatch logs, KMS key
-   * @param cloudFormationClient
+   * Function to check weather accelerator pipeline created code commit repository
    * @param stackName
-   * @param kMSClient
-   * @param cloudWatchLogsClient
-   * @param s3Client
-   * @param backupClient
    * @private
    */
-  private async deleteStackPersistentData(
-    cloudFormationClient: CloudFormationClient,
-    stackName: string,
-    kMSClient: KMSClient,
-    cloudWatchLogsClient: CloudWatchLogsClient,
-    s3Client: S3Client,
-    backupClient: BackupClient,
-  ): Promise<boolean> {
+  private static async isConfigRepositoryCreatedByAccelerator(stackName: string): Promise<boolean> {
+    const cloudFormationClient = new CloudFormationClient({});
     let nextToken: string | undefined = undefined;
     do {
       const page = await throttlingBackOff(() =>
         cloudFormationClient.send(new ListStackResourcesCommand({ StackName: stackName, NextToken: nextToken })),
       );
       for (const stackResourceSummary of page.StackResourceSummaries ?? []) {
-        switch (stackResourceSummary.ResourceType) {
-          case 'AWS::KMS::Key':
-            await this.scheduleKeyDeletion(kMSClient, stackName, stackResourceSummary.PhysicalResourceId!);
-            break;
-          case 'AWS::Backup::BackupVault':
-            await this.deleteBackupVault(backupClient, stackName, stackResourceSummary.PhysicalResourceId!);
-            break;
-          case 'AWS::Logs::LogGroup':
-            await this.deleteCloudWatchLogs(cloudWatchLogsClient, stackName, stackResourceSummary.PhysicalResourceId!);
-            break;
-          case 'AWS::S3::Bucket':
-            const listBucketResponse = await throttlingBackOff(() => s3Client.send(new ListBucketsCommand({})));
-            for (const bucket of listBucketResponse.Buckets!) {
-              if (bucket.Name === stackResourceSummary.PhysicalResourceId) {
-                await this.deleteBucket(s3Client, stackName, stackResourceSummary.PhysicalResourceId!);
-              }
-            }
-            break;
+        if (stackResourceSummary.ResourceType === 'AWS::CodeCommit::Repository') {
+          return true;
         }
       }
       nextToken = page.NextToken;
     } while (nextToken);
-    return true;
+
+    return false;
   }
 
   /**
-   * Function to create list of stack resources for S3, KMS, Cloudwatch logs, which will be deleted after stack deletion completed.
-   * @param cloudFormationClient
+   * Function to delete stack's resources like S3/Cloudwatch logs, KMS key
+   * @param accountId
    * @param stackName
-   * @param kMSClient
+   * @param cloudFormationClient
    * @param cloudWatchLogsClient
    * @param s3Client
+   * @param backupClient
+   * @param iamClient
+   * @param kMSClient
    * @private
    */
-  private async makeStackPersistentObjectList(
-    cloudFormationClient: CloudFormationClient,
+  private async prepareStackResourcesForDelete(
     stackName: string,
-    kMSClient: KMSClient,
+    cloudFormationClient: CloudFormationClient,
     cloudWatchLogsClient: CloudWatchLogsClient,
     s3Client: S3Client,
-  ): Promise<stackPersistentObjectListType[]> {
-    const stackPersistentObjectList: stackPersistentObjectListType[] = [];
+    backupClient: BackupClient,
+    kMSClient: KMSClient,
+    iamClient: IAMClient,
+  ): Promise<void> {
     let nextToken: string | undefined = undefined;
     do {
       const page = await throttlingBackOff(() =>
@@ -1063,39 +1076,56 @@ export class AcceleratorTool {
       for (const stackResourceSummary of page.StackResourceSummaries ?? []) {
         switch (stackResourceSummary.ResourceType) {
           case 'AWS::KMS::Key':
-            stackPersistentObjectList.push({
+            this.kmsKeys.push({
+              client: kMSClient,
               stackName: stackName,
-              resourceType: 'KMS',
-              resourceClient: kMSClient,
-              resourcePhysicalId: stackResourceSummary.PhysicalResourceId!,
+              key: stackResourceSummary.PhysicalResourceId!,
+            });
+            break;
+          case 'AWS::Backup::BackupVault':
+            this.backupVaults.push({
+              client: backupClient,
+              stackName: stackName,
+              backup: stackResourceSummary.PhysicalResourceId!,
             });
             break;
           case 'AWS::Logs::LogGroup':
-            stackPersistentObjectList.push({
+            this.logGroups.push({
+              client: cloudWatchLogsClient,
               stackName: stackName,
-              resourceType: 'CWLogs',
-              resourceClient: cloudWatchLogsClient,
-              resourcePhysicalId: stackResourceSummary.PhysicalResourceId!,
+              logGroup: stackResourceSummary.PhysicalResourceId!,
             });
             break;
           case 'AWS::S3::Bucket':
             const listBucketResponse = await throttlingBackOff(() => s3Client.send(new ListBucketsCommand({})));
             for (const bucket of listBucketResponse.Buckets!) {
               if (bucket.Name === stackResourceSummary.PhysicalResourceId) {
-                stackPersistentObjectList.push({
+                this.buckets.push({
+                  client: s3Client,
                   stackName: stackName,
-                  resourceType: 'S3',
-                  resourceClient: s3Client,
-                  resourcePhysicalId: stackResourceSummary.PhysicalResourceId!,
+                  bucket: stackResourceSummary.PhysicalResourceId!,
                 });
               }
             }
             break;
+          case 'AWS::IAM::Role':
+            // This is needed because SessionManagerEC2Role will have managed policies by SSM automation
+            // which will cause stack deletion to fail
+            // if (
+            //   stackResourceSummary.PhysicalResourceId!.includes('AWSAccelerator-SessionManagerEC2Role') &&
+            //   iamClient
+            // ) {
+            this.iamRoles.push({
+              client: iamClient,
+              stackName: stackName,
+              roleName: stackResourceSummary.PhysicalResourceId!,
+            });
+            // }
+            break;
         }
       }
       nextToken = page.NextToken;
     } while (nextToken);
-    return stackPersistentObjectList;
   }
 
   /**
@@ -1107,48 +1137,83 @@ export class AcceleratorTool {
   private async isStackDeletionCompleted(
     cloudFormationClient: CloudFormationClient,
     stackName: string,
-  ): Promise<boolean> {
-    try {
-      await throttlingBackOff(() => cloudFormationClient.send(new DescribeStacksCommand({ StackName: stackName })));
-      return false;
-    } catch (error) {
-      return `${error}`.includes(`Stack with id ${stackName} does not exist`);
+    retryAttempt: number,
+    maxRetry: number,
+  ): Promise<'FAILED' | 'COMPLETE' | 'IN_PROGRESS'> {
+    if (retryAttempt === 1) {
+      await this.delay(30000);
     }
+    try {
+      const response = await throttlingBackOff(() =>
+        cloudFormationClient.send(new DescribeStacksCommand({ StackName: stackName })),
+      );
+      if (response.Stacks![0].StackStatus === StackStatus.DELETE_FAILED) {
+        if (retryAttempt > maxRetry) {
+          throw Error(
+            `Stack ${stackName} failed to delete, ${retryAttempt} times delete attempted, investigate and fix the issue and rerun uninstaller`,
+          );
+        } else {
+          return 'FAILED';
+        }
+      }
+      if (response.Stacks![0].StackStatus === StackStatus.DELETE_IN_PROGRESS) {
+        if (retryAttempt > maxRetry) {
+          throw Error(
+            `Stack ${stackName} failed to delete, stack is in ${
+              response.Stacks![0].StackStatus
+            } status for more than 10 minutes, uninstaller exited!!!`,
+          );
+        }
+        this.debugLog(`Stack ${stackName} deletion in-progress.....`, 'display');
+        return 'IN_PROGRESS';
+      }
+      if (response.Stacks![0].StackStatus === StackStatus.DELETE_COMPLETE) {
+        return 'COMPLETE';
+      }
+    } catch (error) {
+      if (`${error}`.includes(`Stack ${stackName} does not exist`)) {
+        return 'COMPLETE';
+      }
+    }
+
+    return 'COMPLETE';
   }
 
   /**
    * Function to delete cloudformation stack
-   * @param accountStack
+   * @param stackName
    * @private
    */
-  private async deleteStacks(accountStack: {
-    deleteOrder: number;
-    resourceDetails: [{ accountId: string; stackName: string }];
-  }): Promise<boolean> {
-    const deleteStackStartedPromises: Promise<DeleteStackCommandOutput>[] = [];
-    const deleteStackCompletedPromises: Promise<WaiterResult>[] = [];
-    const assumeRoleName = 'AWSControlTowerExecution';
+  private async deleteStacks(stackName: string): Promise<void> {
+    // const promises: Promise<boolean>[] = [];
+    // const deleteStackStartedPromises: Promise<DeleteStackCommandOutput>[] = [];
+    // const deleteStackCompletedPromises: Promise<WaiterResult>[] = [];
+    const assumeRoleName = this.globalConfig?.managementAccountAccessRole || 'AWSControlTowerExecution';
     let cloudFormationClient: CloudFormationClient;
     let s3Client: S3Client;
     let kMSClient: KMSClient;
     let cloudWatchLogsClient: CloudWatchLogsClient;
     let backupClient: BackupClient;
+    let iamClient: IAMClient;
 
-    let cloudFormationStack: Stack | undefined;
+    // Make list of regions for cleanup of stacks, this is required because some stack goes to global region
+    const cleanupRegions: string[] = [];
+    for (const region of this.globalConfig?.enabledRegions || []) {
+      cleanupRegions.push(region);
+    }
+
+    if (cleanupRegions.indexOf(this.globalRegion) === -1) {
+      cleanupRegions.push(this.globalRegion);
+    }
+
+    // let cloudFormationStack: Stack | undefined;
     //Use a loop for all regions
-    for (const region of this.globalConfig!.enabledRegions) {
-      for (const resource of accountStack.resourceDetails) {
-        if (resource.accountId !== this.pipelineManagementAccount?.accountId) {
-          const roleArn = `arn:${this.acceleratorToolProps.partition}:iam::${resource.accountId}:role/${assumeRoleName}`;
+    for (const region of cleanupRegions) {
+      for (const account of this.organizationAccounts) {
+        if (account.accountId !== this.pipelineManagementAccount?.accountId) {
+          const roleArn = `arn:${this.acceleratorToolProps.partition}:iam::${account.accountId}:role/${assumeRoleName}`;
           const stsClient = new STSClient({ region: region });
-          const assumeRoleCredential = await throttlingBackOff(() =>
-            stsClient.send(
-              new AssumeRoleCommand({
-                RoleArn: roleArn,
-                RoleSessionName: 'acceleratorAssumeRoleSession',
-              }),
-            ),
-          );
+          const assumeRoleCredential = await this.assumeRole(stsClient, roleArn);
           cloudFormationClient = new CloudFormationClient({
             region: region,
             credentials: {
@@ -1167,15 +1232,7 @@ export class AcceleratorTool {
               expiration: assumeRoleCredential.Credentials!.Expiration,
             },
           });
-          kMSClient = new KMSClient({
-            region: region,
-            credentials: {
-              accessKeyId: assumeRoleCredential.Credentials!.AccessKeyId!,
-              secretAccessKey: assumeRoleCredential.Credentials!.SecretAccessKey!,
-              sessionToken: assumeRoleCredential.Credentials!.SessionToken,
-              expiration: assumeRoleCredential.Credentials!.Expiration,
-            },
-          });
+
           cloudWatchLogsClient = new CloudWatchLogsClient({
             region: region,
             credentials: {
@@ -1194,28 +1251,31 @@ export class AcceleratorTool {
               expiration: assumeRoleCredential.Credentials!.Expiration,
             },
           });
+          iamClient = new IAMClient({
+            region: region,
+            credentials: {
+              accessKeyId: assumeRoleCredential.Credentials!.AccessKeyId!,
+              secretAccessKey: assumeRoleCredential.Credentials!.SecretAccessKey!,
+              sessionToken: assumeRoleCredential.Credentials!.SessionToken,
+              expiration: assumeRoleCredential.Credentials!.Expiration,
+            },
+          });
+          kMSClient = new KMSClient({
+            region: region,
+            credentials: {
+              accessKeyId: assumeRoleCredential.Credentials!.AccessKeyId!,
+              secretAccessKey: assumeRoleCredential.Credentials!.SecretAccessKey!,
+              sessionToken: assumeRoleCredential.Credentials!.SessionToken,
+              expiration: assumeRoleCredential.Credentials!.Expiration,
+            },
+          });
         } else {
           cloudFormationClient = new CloudFormationClient({ region: region });
           s3Client = new S3Client({ region: region });
-          kMSClient = new KMSClient({ region: region });
           cloudWatchLogsClient = new CloudWatchLogsClient({ region: region });
           backupClient = new BackupClient({ region: region });
-        }
-
-        const fullyQualifiedStackName = `${resource.stackName}-${resource.accountId}-${region}`;
-
-        try {
-          const response = await throttlingBackOff(() =>
-            cloudFormationClient.send(new DescribeStacksCommand({ StackName: fullyQualifiedStackName })),
-          );
-          cloudFormationStack = response.Stacks![0];
-        } catch (error) {
-          if (`${error}`.includes(`Stack with id ${fullyQualifiedStackName} does not exist`)) {
-            Logger.warn(
-              `[accelerator-tool] Stack with id ${fullyQualifiedStackName} does not exist in ${resource.accountId} account in ${region} region`,
-            );
-            cloudFormationStack = undefined;
-          }
+          iamClient = new IAMClient({ region: region });
+          kMSClient = new KMSClient({ region: region });
         }
 
         // Exclude management account home region bootstrap deletion before pipeline stack and installer stacks are deleted, conditions are
@@ -1223,91 +1283,38 @@ export class AcceleratorTool {
         // 2. When stack is for home region
         // 3. When it is bootstrap stack
         // 4. When stack is part of management account
+        // 5. When keepBootstraps flag is OFF
         if (
-          cloudFormationStack &&
+          // cloudFormationStack &&
           !this.externalPipelineAccount.isUsed &&
           this.globalConfig?.homeRegion === region &&
-          cloudFormationStack?.StackName === 'AWSAccelerator-CDKToolkit' &&
-          this.pipelineManagementAccount!.accountId === resource.accountId &&
+          stackName === 'AWSAccelerator-CDKToolkit' &&
+          this.pipelineManagementAccount!.accountId === account.accountId &&
           !this.acceleratorToolProps.keepBootstraps
         ) {
-          Logger.info(`[accelerator-tool] Management account home region bootstrap stack deletion excluded`);
-          Logger.info(
-            `[accelerator-tool] ${cloudFormationStack?.StackName} stack region is ${region} and home region is ${this.globalConfig?.homeRegion}`,
+          this.debugLog(`Management account home region bootstrap stack deletion excluded`, 'info');
+          this.debugLog(
+            `${stackName} stack region is ${region} and home region is ${this.globalConfig?.homeRegion}`,
+            'info',
           );
-
-          cloudFormationStack = undefined;
-        }
-
-        if (
-          cloudFormationStack &&
-          (await this.isStackDeletable(
-            cloudFormationClient,
-            cloudFormationStack.StackName!,
-            resource.accountId,
-            region,
-          ))
-        ) {
-          Logger.info(
-            `[accelerator-tool] Deleting CloudFormation stack ${cloudFormationStack!.StackName} in ${
-              resource.accountId
-            } account from ${region} region`,
-          );
-
-          // If delete-data flag is on perform deletion, before stack deletion
-          if (this.acceleratorToolProps.deleteData) {
-            Logger.info('[accelerator-tool] delete-data flag is ON !!!');
-
-            // Since prepare stack have dependencies on KSM key, can't delete resources before stacks deleted.
-            if (cloudFormationStack!.StackName!.includes('PrepareStack')) {
-              this.prepareStackPersistentObjectList = await this.makeStackPersistentObjectList(
-                cloudFormationClient,
-                cloudFormationStack!.StackName!,
-                kMSClient,
-                cloudWatchLogsClient,
-                s3Client,
-              );
-            } else {
-              await this.deleteStackPersistentData(
-                // this.stackPersistentObjectList = await this.makeStackPersistentObjectList(
-                cloudFormationClient,
-                cloudFormationStack!.StackName!,
-                kMSClient,
-                cloudWatchLogsClient,
-                s3Client,
-                backupClient,
-              );
-            }
-          } else {
-            Logger.info('[accelerator-tool] delete-data flag is OFF');
-          }
-
-          deleteStackStartedPromises.push(
-            cloudFormationClient.send(new DeleteStackCommand({ StackName: cloudFormationStack!.StackName! })),
-          );
-
-          // This is required to make sure stacks are deleted before moving to next stage of stack deletion
-          deleteStackCompletedPromises.push(
-            waitUntilStackDeleteComplete(
-              { client: cloudFormationClient, maxWaitTime: 3600 }, // waitTime is in second
-              { StackName: cloudFormationStack!.StackName! },
-            ),
-          );
+        } else {
+          this.deleteStackLists.push({
+            clients: {
+              cloudFormation: cloudFormationClient,
+              cloudWatchLogs: cloudWatchLogsClient,
+              s3: s3Client,
+              backup: backupClient,
+              iam: iamClient,
+              kms: kMSClient,
+            },
+            stackName: stackName!,
+            accountID: account.accountId,
+            region: region,
+          });
         }
       }
     }
-
-    if (deleteStackStartedPromises.length > 0 && deleteStackCompletedPromises.length > 0) {
-      Logger.info(`[accelerator-tool] Total ${deleteStackStartedPromises.length} stack(s) will be deleted.`);
-      const start = new Date().getTime();
-      await Promise.all(deleteStackStartedPromises);
-      await Promise.all(deleteStackCompletedPromises);
-      const elapsed = Math.round((new Date().getTime() - start) / 60000);
-      Logger.info(
-        `[accelerator-tool] Total ${deleteStackCompletedPromises.length} stack(s) deleted successfully. Elapsed time - ~${elapsed} minutes`,
-      );
-    }
-    return true;
+    await this.completeStacksDeletion();
   }
 
   /**
@@ -1319,7 +1326,7 @@ export class AcceleratorTool {
    * @param region
    * @private
    */
-  private async isStackDeletable(
+  private async disableStackTermination(
     cloudFormationClient: CloudFormationClient,
     stackName: string,
     accountId?: string,
@@ -1332,8 +1339,9 @@ export class AcceleratorTool {
     enableTerminationProtection = response.Stacks![0].EnableTerminationProtection ?? false;
     if (enableTerminationProtection) {
       if (this.acceleratorToolProps.ignoreTerminationProtection) {
-        Logger.warn(
-          `[accelerator-tool] Stack ${stackName} termination protection is enabled, disabling the termination protection"`,
+        this.debugLog(
+          `Stack ${stackName} termination protection is enabled, disabling the termination protection"`,
+          'info',
         );
         await throttlingBackOff(() =>
           cloudFormationClient.send(
@@ -1343,27 +1351,25 @@ export class AcceleratorTool {
             }),
           ),
         );
-        Logger.warn(`[accelerator-tool] Waiting stack ${stackName} update completion"`);
-        waitUntilStackUpdateComplete(
-          { client: cloudFormationClient, maxWaitTime: 3600 }, // waitTime is in second
-          { StackName: stackName },
-        );
+        this.debugLog(`Waiting stack ${stackName} update completion"`, 'info');
+
+        await this.delay(1000);
+
         return true;
       } else {
         if (stackName && accountId) {
-          Logger.warn(
-            `[accelerator-tool] Due to termination protection enable skipping deletion of CloudFormation stack ${stackName} in ${accountId} account from ${region} region`,
+          this.debugLog(
+            `Due to termination protection enable skipping deletion of CloudFormation stack ${stackName} in ${accountId} account from ${region} region`,
+            'warn',
           );
         } else {
-          Logger.warn(
-            `[accelerator-tool] Due to termination protection enable skipping deletion of CloudFormation stack ${stackName}`,
+          this.debugLog(
+            `Due to termination protection enable skipping deletion of CloudFormation stack ${stackName}`,
+            'warn',
           );
         }
-        Logger.warn(
-          `[accelerator-tool] Uninstallation STOPPED, due to termination protection of  stack ${stackName}!!!"`,
-        );
+        this.debugLog(`Un-installation STOPPED, due to termination protection of  stack ${stackName}!!!"`, 'warn');
         process.abort();
-        return false;
       }
     } else {
       return true;
@@ -1375,7 +1381,7 @@ export class AcceleratorTool {
    * @param stackNamePrefix
    * @private
    */
-  private async deleteTesterStack(stackNamePrefix: string): Promise<boolean> {
+  private async deleteTesterStack(stackNamePrefix: string): Promise<void> {
     const cloudFormationClient = new CloudFormationClient({});
     const testerStackName = `${stackNamePrefix}-${
       this.externalPipelineAccount.isUsed
@@ -1384,7 +1390,6 @@ export class AcceleratorTool {
     }-${this.globalConfig?.homeRegion}`;
 
     await this.deleteStack(cloudFormationClient, testerStackName);
-    return true;
   }
 
   /**
@@ -1396,11 +1401,11 @@ export class AcceleratorTool {
   private async deleteTesterPipelineStack(
     testerPipelineStackNamePrefix: string,
     testerPipelineConfigRepositoryName: string,
-  ): Promise<boolean> {
+  ): Promise<void> {
     const cloudFormationClient = new CloudFormationClient({});
 
-    if (!this.acceleratorToolProps.deletePipelines) {
-      return true;
+    if (this.acceleratorToolProps.keepPipelineAndConfig) {
+      return;
     }
 
     const testerPipelineStackName = `${testerPipelineStackNamePrefix}-${
@@ -1409,7 +1414,7 @@ export class AcceleratorTool {
         : this.pipelineManagementAccount!.accountId
     }-${this.globalConfig?.homeRegion}`;
 
-    if (this.acceleratorToolProps.deleteConfigRepo) {
+    if (!this.acceleratorToolProps.keepPipelineAndConfig) {
       await this.deleteCodecommitRepository(new CodeCommitClient({}), testerPipelineConfigRepositoryName);
     }
 
@@ -1426,8 +1431,6 @@ export class AcceleratorTool {
     }
 
     await this.deleteStack(cloudFormationClient, testerPipelineStackName);
-
-    return true;
   }
 
   /**
@@ -1436,43 +1439,39 @@ export class AcceleratorTool {
    * @param stackName
    * @private
    */
-  private async deleteStack(cloudFormationClient: CloudFormationClient, stackName: string): Promise<boolean> {
+  private async deleteStack(cloudFormationClient: CloudFormationClient, stackName: string): Promise<void> {
     try {
       await throttlingBackOff(() => cloudFormationClient.send(new DescribeStacksCommand({ StackName: stackName })));
       // cloudFormationStack = response.Stacks![0].StackName;
     } catch (error) {
       if (`${error}`.includes(`Stack with id ${stackName} does not exist`)) {
-        Logger.warn(`[accelerator-tool] Stack with id ${stackName} does not exist`);
-        return true;
+        this.debugLog(`Stack ${stackName} does not exist`, 'warn');
+        return;
       }
     }
 
-    if (!(await this.isStackDeletable(cloudFormationClient, stackName))) {
-      return true;
+    if (!(await this.disableStackTermination(cloudFormationClient, stackName))) {
+      return;
     }
 
-    if (this.acceleratorToolProps.deleteData) {
-      // Delete Installer stack persistent data
-      await this.deleteStackPersistentData(
-        cloudFormationClient,
-        stackName,
-        new KMSClient({}),
-        new CloudWatchLogsClient({}),
-        new S3Client({}),
-        new BackupClient({}),
-      );
-    }
+    // Prepare list of resources to be deleted before and after stack deletion
+    await this.prepareStackResourcesForDelete(
+      stackName,
+      cloudFormationClient,
+      new CloudWatchLogsClient({}),
+      new S3Client({}),
+      new BackupClient({}),
+      new KMSClient({}),
+      new IAMClient({}),
+    );
 
-    Logger.info(`[accelerator-tool] Deleting stack ${stackName}`);
-    await throttlingBackOff(() => cloudFormationClient.send(new DeleteStackCommand({ StackName: `${stackName}` })));
+    // Delete resource before stack deletion
+    await this.deletePreStackDeleteResources();
 
-    Logger.info(`[accelerator-tool] Waiting until stack ${stackName} deletion completes`);
-    while (!(await this.isStackDeletionCompleted(cloudFormationClient, stackName))) {
-      // Wait before checking again
-      await new Promise(func => setTimeout(func, 1000));
-    }
-    Logger.info(`[accelerator-tool] Stack ${stackName} deleted successfully`);
-    return true;
+    await this.completeStackDeletion(cloudFormationClient, stackName);
+
+    // Delete resource after stack deletion
+    await this.deletePostStackDeleteResources();
   }
 
   /**
@@ -1481,54 +1480,13 @@ export class AcceleratorTool {
    * @param repositoryName
    * @private
    */
-  private async deleteCodecommitRepository(
-    codeCommitClient: CodeCommitClient,
-    repositoryName: string,
-  ): Promise<boolean> {
+  private async deleteCodecommitRepository(codeCommitClient: CodeCommitClient, repositoryName: string): Promise<void> {
     //Delete config repository
-    Logger.info(`[accelerator-tool] Deleting code commit repository ${repositoryName}`);
+    this.debugLog(`CodeCommit repository ${repositoryName} deletion started`, 'display');
     await throttlingBackOff(() =>
       codeCommitClient.send(new DeleteRepositoryCommand({ repositoryName: repositoryName })),
     );
-
-    return true;
-  }
-
-  /**
-   * Delete prepare stack resources
-   * @private
-   */
-  private async deletePrepareStackResources(): Promise<boolean> {
-    // Now delete persistent resources from deleted stacks
-    Logger.info(`[accelerator-tool] Deleting S3, cloudwatch logs and KMS keys`);
-    for (const stackPersistentObject of this.prepareStackPersistentObjectList) {
-      switch (stackPersistentObject.resourceType) {
-        case 'KMS':
-          // await this.scheduleKeyDeletion(kMSClient, stackName, stackResourceSummary.PhysicalResourceId!);
-          await this.scheduleKeyDeletion(
-            stackPersistentObject.resourceClient as KMSClient,
-            stackPersistentObject.stackName,
-            stackPersistentObject.resourcePhysicalId,
-          );
-          break;
-        case 'CWLogs':
-          await this.deleteCloudWatchLogs(
-            stackPersistentObject.resourceClient as CloudWatchLogsClient,
-            stackPersistentObject.stackName,
-            stackPersistentObject.resourcePhysicalId,
-          );
-          break;
-        case 'S3':
-          await this.deleteBucket(
-            stackPersistentObject.resourceClient as S3Client,
-            stackPersistentObject.stackName,
-            stackPersistentObject.resourcePhysicalId,
-          );
-          break;
-      }
-    }
-
-    return true;
+    this.debugLog(`CodeCommit repository ${repositoryName} deletion completed`, 'display');
   }
 
   /**
@@ -1537,7 +1495,7 @@ export class AcceleratorTool {
    * @param buildProjectName
    * @private
    */
-  private async deleteCodeBuilds(codeBuildClient: CodeBuildClient, buildProjectName: string): Promise<boolean> {
+  private async deleteCodeBuilds(codeBuildClient: CodeBuildClient, buildProjectName: string): Promise<void> {
     //delete code build projects before deleting pipeline
     const buildIds: string[] = [];
     let nextToken: string | undefined = undefined;
@@ -1550,8 +1508,546 @@ export class AcceleratorTool {
       }
       nextToken = page.nextToken;
     } while (nextToken);
-    Logger.info(`[accelerator-tool] Deleting build ids for the project ${buildProjectName}`);
+    this.debugLog(`Deleting build ids for the project ${buildProjectName}`, 'info');
     await throttlingBackOff(() => codeBuildClient.send(new BatchDeleteBuildsCommand({ ids: buildIds })));
-    return true;
+  }
+
+  /**
+   *
+   * @returns Function to filter stages to be deleted based on input stage name
+   */
+  private filterPipelineStages() {
+    const requiredStages: {
+      stage: string;
+      order: number;
+      actions: stageActionType[];
+    }[] = [];
+    let stageOrder = 0;
+    let actionOrder = 0;
+
+    // filter based on stage name
+
+    if (this.acceleratorToolProps.stageName !== 'all') {
+      if (this.pipelineStageNames.indexOf(this.acceleratorToolProps.stageName.toLowerCase()) === -1) {
+        throw new Error(`Invalid pipeline stage name ${this.acceleratorToolProps.stageName}`);
+      }
+
+      for (const stage of this.pipelineStageActions) {
+        if (stage.stage.toLowerCase() === this.acceleratorToolProps.stageName.toLowerCase()) {
+          stageOrder = stage.order;
+        }
+      }
+      this.pipelineStageActions = this.pipelineStageActions.filter(item => item.order >= stageOrder);
+    }
+
+    // Exclude bootstrap stacks when keepBootstraps flag is on
+    if (this.acceleratorToolProps.keepBootstraps) {
+      this.pipelineStageActions = this.pipelineStageActions.filter(item => item.stage.toLowerCase() !== 'bootstrap');
+    }
+
+    //
+    // Filter based on action name
+    stageOrder = 0;
+    if (this.acceleratorToolProps.actionName !== 'all') {
+      if (this.pipelineActionNames.indexOf(this.acceleratorToolProps.actionName.toLowerCase()) === -1) {
+        throw new Error(`Invalid pipeline action name ${this.acceleratorToolProps.actionName}`);
+      }
+
+      for (const stage of this.pipelineStageActions) {
+        for (const action of stage.actions) {
+          if (action.name.toLowerCase() === this.acceleratorToolProps.actionName.toLowerCase()) {
+            actionOrder = action.order;
+            stageOrder = stage.order;
+          }
+        }
+      }
+    }
+    this.pipelineStageActions = this.pipelineStageActions.filter(item => item.order >= stageOrder);
+
+    for (const stage of this.pipelineStageActions) {
+      for (const action of stage.actions!.filter(item => item.order >= actionOrder)) {
+        requiredStages.push({ stage: stage.stage, order: stage.order, actions: [action] });
+      }
+    }
+
+    this.pipelineStageActions = requiredStages;
+  }
+
+  /**
+   * Function to get pipeline repository names
+   * @param stage
+   */
+  private getPipelineRepos(stage: StageDeclaration) {
+    if (stage.name === 'Source') {
+      for (const action of stage.actions!) {
+        if (action.name! === 'Configuration') {
+          this.pipelineConfigSourceRepo = {
+            repositoryName: action.configuration!['RepositoryName'],
+            branch: action.configuration!['BranchName'],
+            provider: action.actionTypeId!.provider!,
+          };
+        }
+      }
+    }
+  }
+
+  /**
+   * Function to get pipeline action names
+   * @param stage
+   */
+  private getPipelineActionNames(stage: StageDeclaration) {
+    if (stage.name !== 'Source' && stage.name !== 'Build' && stage.name !== 'Review') {
+      for (const action of stage.actions!) {
+        this.pipelineActionNames.push(action.name!.toLowerCase());
+      }
+    }
+  }
+
+  /**
+   * Function to get pipeline build projects
+   */
+  private getCodebuildProjects(stage: StageDeclaration) {
+    for (const action of stage.actions ?? []) {
+      if (
+        action.configuration!['ProjectName'] &&
+        !this.acceleratorCodeBuildProjects.find(item => item === action.configuration!['ProjectName'])
+      ) {
+        this.acceleratorCodeBuildProjects.push(action.configuration!['ProjectName']);
+      }
+    }
+  }
+
+  /**
+   * Function to get pipeline bootstrap stage environment variables
+   * @param stage
+   */
+  private async getBootstrapEnvVariables(stage: StageDeclaration) {
+    if (stage.name === 'Bootstrap') {
+      this.bootstrapBuildEnvironmentVariables = await this.getCodeBuildEnvironmentVariables(
+        stage.actions![0].configuration!['ProjectName'],
+      );
+    }
+  }
+
+  /**
+   * Function to schedule deletion of ksm keys post stack deletion
+   */
+  private async deleteKmsKeys() {
+    if (!this.acceleratorToolProps.keepData) {
+      for (const item of this.kmsKeys) {
+        await this.scheduleKeyDeletion(item.client, item.stackName, item.key);
+      }
+    }
+    this.kmsKeys = [];
+  }
+
+  /**
+   * Function to delete backup vaults
+   */
+  private async deleteBackupVaults() {
+    if (!this.acceleratorToolProps.keepData) {
+      for (const item of this.backupVaults) {
+        await this.deleteBackupVault(item.client, item.stackName, item.backup);
+      }
+    }
+    this.backupVaults = [];
+  }
+
+  /**
+   * Function to delete log groups
+   */
+  private async deleteLogGroups() {
+    if (!this.acceleratorToolProps.keepData) {
+      for (const item of this.logGroups) {
+        await this.deleteCloudWatchLogs(item.client, item.stackName, item.logGroup);
+      }
+    }
+    this.logGroups = [];
+  }
+
+  /**
+   * Function to delete buckets post stack deletion, if buckets deleted before stack replication custom resource will fail
+   */
+  private async deleteBuckets() {
+    if (!this.acceleratorToolProps.keepData) {
+      for (const item of this.buckets) {
+        await this.deleteBucket(item.client, item.stackName, item.bucket);
+      }
+    }
+    this.buckets = [];
+  }
+
+  /**
+   * Function to check if stack exists
+   * @param cloudFormationClient
+   * @param stackName
+   * @param accountId
+   * @param region
+   * @returns
+   */
+  private async validateStackExistence(
+    cloudFormationClient: CloudFormationClient,
+    stackName: string,
+    accountId: string,
+    region: string,
+  ): Promise<Stack | undefined> {
+    let cloudFormationStack: Stack | undefined;
+    try {
+      const response = await throttlingBackOff(() =>
+        cloudFormationClient.send(new DescribeStacksCommand({ StackName: stackName })),
+      );
+      cloudFormationStack = response.Stacks![0];
+    } catch (error) {
+      if (`${error}`.includes(`Stack with id ${stackName} does not exist`)) {
+        this.debugLog(`Stack ${stackName} does not exist in ${accountId} account in ${region} region`, 'info');
+        cloudFormationStack = undefined;
+      }
+    }
+
+    return cloudFormationStack;
+  }
+
+  private async completeStacksDeletion() {
+    const promises: Promise<void>[] = [];
+    let stackName = '';
+    for (const item of this.deleteStackLists) {
+      stackName = item.stackName;
+      const fullyQualifiedStackName =
+        item.stackName === 'AWSAccelerator-CDKToolkit'
+          ? 'AWSAccelerator-CDKToolkit'
+          : `${item.stackName}-${item.accountID}-${item.region}`;
+
+      const stackExists = await this.validateStackExistence(
+        item.clients.cloudFormation,
+        fullyQualifiedStackName,
+        item.accountID,
+        item.region,
+      );
+
+      if (stackExists) {
+        await this.disableStackTermination(
+          item.clients.cloudFormation,
+          fullyQualifiedStackName,
+          item.accountID,
+          item.region,
+        );
+
+        // Prepare list of resources to be deleted before and after stack deletion
+        await this.prepareStackResourcesForDelete(
+          fullyQualifiedStackName,
+          item.clients.cloudFormation,
+          item.clients.cloudWatchLogs,
+          item.clients.s3,
+          item.clients.backup,
+          item.clients.kms,
+          item.clients.iam,
+        );
+
+        promises.push(this.cleanupStack(item.clients.cloudFormation, fullyQualifiedStackName));
+      }
+    }
+
+    if (promises.length >= 0) {
+      await Promise.all(promises);
+    }
+
+    await Promise.all(promises);
+
+    //
+    // Network vpcs stack takes time to deallocate IPAM
+    if (promises.length > 0 && stackName === 'AWSAccelerator-NetworkVpcStack') {
+      await this.delay(360000);
+    }
+    this.deleteStackLists = [];
+  }
+
+  /**
+   * Function to clean stack and it's resources
+   * @param cloudFormationClient
+   * @param stackName
+   */
+  private async cleanupStack(cloudFormationClient: CloudFormationClient, stackName: string) {
+    await this.deletePreStackDeleteResources();
+    await this.completeStackDeletion(cloudFormationClient, stackName);
+    await this.deletePostStackDeleteResources();
+  }
+
+  /**
+   * Function to delete resources before stack deletion
+   */
+  private async deletePreStackDeleteResources(): Promise<void> {
+    // Delete IAM roles
+    await this.deleteIamRolePolicy();
+  }
+
+  /**
+   * Function to delete resources after stack deletion
+   */
+  private async deletePostStackDeleteResources(): Promise<void> {
+    // Delete cloudwatch log groups
+    await this.deleteLogGroups();
+
+    // Delete backup vaults
+    await this.deleteBackupVaults();
+
+    // Delete buckets
+    await this.deleteBuckets();
+
+    // Delete KMS keys
+    await this.deleteKmsKeys();
+  }
+
+  private async completeStackDeletion(cloudFormationClient: CloudFormationClient, stackName: string): Promise<void> {
+    let retryAttempt = 1;
+    this.debugLog(`Stack ${stackName} deletion started.`, 'display');
+    await throttlingBackOff(() => cloudFormationClient.send(new DeleteStackCommand({ StackName: stackName })));
+
+    let stackDeleteStatus = await this.isStackDeletionCompleted(cloudFormationClient, stackName, retryAttempt, 2);
+
+    while (stackDeleteStatus !== 'COMPLETE') {
+      // Wait before retry
+      await this.delay(60000);
+      if (stackDeleteStatus === 'FAILED') {
+        retryAttempt = retryAttempt + 1;
+        this.debugLog(
+          `Stack ${stackName} deletion status ${stackDeleteStatus}, retry deletion, retry count ${retryAttempt}`,
+          'info',
+        );
+
+        await throttlingBackOff(() => cloudFormationClient.send(new DeleteStackCommand({ StackName: stackName })));
+        stackDeleteStatus = await this.isStackDeletionCompleted(cloudFormationClient, stackName, retryAttempt, 3);
+      } else {
+        stackDeleteStatus = await this.isStackDeletionCompleted(cloudFormationClient, stackName, retryAttempt, 10);
+      }
+    }
+
+    this.debugLog(`Stack ${stackName} deletion completed.`, 'display');
+  }
+
+  private delay(ms: number) {
+    return new Promise(resolve => setTimeout(resolve, ms));
+  }
+
+  private debugLog(message: string, messageType: string) {
+    switch (messageType) {
+      case 'warn':
+        this.logger.warn(message);
+        break;
+      case 'info':
+        if (this.acceleratorToolProps.debug) {
+          this.logger.warn(message);
+        }
+        break;
+      case 'debug':
+        if (this.acceleratorToolProps.debug) {
+          this.logger.warn(message);
+        }
+        break;
+      case 'display':
+        this.logger.info(message);
+        break;
+    }
+  }
+
+  /**
+   * Function to set global region
+   */
+  private setGlobalRegion() {
+    if (this.acceleratorToolProps.partition === 'aws-us-gov') {
+      this.globalRegion = 'us-gov-west-1';
+    }
+
+    if (this.acceleratorToolProps.partition === 'aws-iso-b') {
+      this.globalRegion = 'us-isob-east-1';
+    }
+
+    if (this.acceleratorToolProps.partition === 'aws-cn') {
+      this.globalRegion = 'cn-northwest-1';
+    }
+  }
+
+  private async finalCleanup(acceleratorQualifier: string): Promise<void> {
+    //cleanup CWL logs
+    await this.deleteAllRemainingCloudWatchLogGroups(acceleratorQualifier);
+
+    await this.deleteAllEcrs();
+    return;
+  }
+
+  private async deleteAllEcrs(): Promise<void> {
+    const assumeRoleName = this.globalConfig?.managementAccountAccessRole || 'AWSControlTowerExecution';
+    let ecrClient: ECRClient;
+
+    // Make list of regions for cleanup of stacks, this is required because some stack goes to global region
+    const cleanupRegions: string[] = [];
+    for (const region of this.globalConfig?.enabledRegions || []) {
+      cleanupRegions.push(region);
+    }
+
+    if (cleanupRegions.indexOf(this.globalRegion) === -1) {
+      cleanupRegions.push(this.globalRegion);
+    }
+
+    //Use a loop for all regions
+    for (const region of cleanupRegions) {
+      for (const account of this.organizationAccounts) {
+        if (account.accountId !== this.pipelineManagementAccount?.accountId) {
+          const roleArn = `arn:${this.acceleratorToolProps.partition}:iam::${account.accountId}:role/${assumeRoleName}`;
+          const stsClient = new STSClient({ region: region });
+          const assumeRoleCredential = await this.assumeRole(stsClient, roleArn);
+
+          ecrClient = new ECRClient({
+            region: region,
+            credentials: {
+              accessKeyId: assumeRoleCredential.Credentials!.AccessKeyId!,
+              secretAccessKey: assumeRoleCredential.Credentials!.SecretAccessKey!,
+              sessionToken: assumeRoleCredential.Credentials!.SessionToken,
+              expiration: assumeRoleCredential.Credentials!.Expiration,
+            },
+          });
+        } else {
+          ecrClient = new ECRClient({ region: region });
+        }
+
+        this.debugLog(`Final Ecrs cleanup started in region ${region} of account ${account.accountName}`, 'display');
+        let nextToken: string | undefined = undefined;
+        const repositories: string[] = [];
+        try {
+          do {
+            const page = await throttlingBackOff(() =>
+              ecrClient.send(
+                new DescribeRepositoriesCommand({
+                  repositoryNames: [`cdk-accel-container-assets-${account.accountId}-${region}`],
+                  nextToken: nextToken,
+                }),
+              ),
+            );
+            for (const repository of page.repositories ?? []) {
+              repositories.push(repository.repositoryName!);
+            }
+            nextToken = page.nextToken;
+          } while (nextToken);
+        } catch (RepositoryNotFoundException) {
+          this.debugLog(
+            `Ecr delete Error, repository NOT FOUND cdk-accel-container-assets-${account.accountId}-${region} in region ${region} of account ${account.accountName}`,
+            'info',
+          );
+        }
+
+        for (const repository of repositories) {
+          this.debugLog(`Deleting Ecr ${repository} in region ${region} of account ${account.accountName}`, 'info');
+          try {
+            await throttlingBackOff(() => ecrClient.send(new DeleteEcr({ repositoryName: repository })));
+            this.debugLog(
+              `Ecr ${repository} in region ${region} of account ${account.accountName} deleted successfully`,
+              'info',
+            );
+          } catch (RepositoryNotFoundException) {
+            this.debugLog(
+              `Ecr delete Error, repository NOT FOUND ${repository} in region ${region} of account ${account.accountName}`,
+              'info',
+            );
+          }
+        }
+      }
+    }
+  }
+
+  private async deleteAllRemainingCloudWatchLogGroups(acceleratorQualifier: string): Promise<void> {
+    const assumeRoleName = this.globalConfig?.managementAccountAccessRole || 'AWSControlTowerExecution';
+    let cloudWatchLogsClient: CloudWatchLogsClient;
+
+    // Make list of regions for cleanup of stacks, this is required because some stack goes to global region
+    const cleanupRegions: string[] = [];
+    for (const region of this.globalConfig?.enabledRegions || []) {
+      cleanupRegions.push(region);
+    }
+
+    if (cleanupRegions.indexOf(this.globalRegion) === -1) {
+      cleanupRegions.push(this.globalRegion);
+    }
+
+    // let cloudFormationStack: Stack | undefined;
+    //Use a loop for all regions
+    for (const region of cleanupRegions) {
+      for (const account of this.organizationAccounts) {
+        if (account.accountId !== this.pipelineManagementAccount?.accountId) {
+          const roleArn = `arn:${this.acceleratorToolProps.partition}:iam::${account.accountId}:role/${assumeRoleName}`;
+          const stsClient = new STSClient({ region: region });
+          const assumeRoleCredential = await this.assumeRole(stsClient, roleArn);
+
+          cloudWatchLogsClient = new CloudWatchLogsClient({
+            region: region,
+            credentials: {
+              accessKeyId: assumeRoleCredential.Credentials!.AccessKeyId!,
+              secretAccessKey: assumeRoleCredential.Credentials!.SecretAccessKey!,
+              sessionToken: assumeRoleCredential.Credentials!.SessionToken,
+              expiration: assumeRoleCredential.Credentials!.Expiration,
+            },
+          });
+        } else {
+          cloudWatchLogsClient = new CloudWatchLogsClient({ region: region });
+        }
+
+        this.debugLog(`Final log groups cleanup started in region ${region} of account ${account}`, 'display');
+
+        let nextToken: string | undefined = undefined;
+        const logGroupNames: string[] = [];
+        do {
+          const page = await throttlingBackOff(() =>
+            cloudWatchLogsClient.send(
+              new DescribeLogGroupsCommand({
+                logGroupNamePrefix: `/aws/codebuild/${acceleratorQualifier}`,
+                nextToken: nextToken,
+              }),
+            ),
+          );
+          for (const logGroup of page.logGroups ?? []) {
+            logGroupNames.push(logGroup.logGroupName!);
+          }
+          nextToken = page.nextToken;
+        } while (nextToken);
+
+        nextToken = undefined;
+        do {
+          const page = await throttlingBackOff(() =>
+            cloudWatchLogsClient.send(
+              new DescribeLogGroupsCommand({
+                logGroupNamePrefix: `/aws/lambda/${acceleratorQualifier}`,
+                nextToken: nextToken,
+              }),
+            ),
+          );
+          for (const logGroup of page.logGroups ?? []) {
+            logGroupNames.push(logGroup.logGroupName!);
+          }
+          nextToken = page.nextToken;
+        } while (nextToken);
+
+        // Add /AWSAccelerator-SecurityHub log groups for deletion
+        logGroupNames.push('/AWSAccelerator-SecurityHub');
+
+        for (const logGroupName of logGroupNames) {
+          this.debugLog(
+            `Deleting Cloudwatch Log group ${logGroupName} in region ${region} of account ${account}`,
+            'info',
+          );
+          try {
+            await throttlingBackOff(() =>
+              cloudWatchLogsClient.send(new DeleteLogGroupCommand({ logGroupName: logGroupName })),
+            );
+          } catch (ResourceNotFoundException) {
+            this.debugLog(
+              `Cloudwatch Log group delete Error Log Group NOT FOUND ${logGroupName} in region ${region} of account ${account}`,
+              'info',
+            );
+          }
+        }
+
+        // cleanup the
+        logGroupNames.length = 0;
+        this.debugLog(`Log groups cleanup completed in region ${region} of account ${account}`, 'display');
+      }
+    }
   }
 }

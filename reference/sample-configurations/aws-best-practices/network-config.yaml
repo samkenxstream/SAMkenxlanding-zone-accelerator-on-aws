@@ -1,7 +1,17 @@
 homeRegion: &HOME_REGION us-east-1
+#####################################
+# Delete default VPCs-- use this    #
+# object to delete default VPCs in  #
+# any non-excluded accounts         #
+#####################################
 defaultVpc:
   delete: true
   excludeAccounts: []
+
+#####################################
+# Transit Gateways-- use this object #
+# to deploy transit gateways         #
+#####################################
 transitGateways:
   - name: Network-Main
     account: Network
@@ -18,18 +28,31 @@ transitGateways:
     routeTables:
       - name: Network-Main-Core
         routes: []
+        # Use routes to define static routes for TGW route tables.
         # - destinationCidrBlock: 10.100.0.0/16
         #     attachment:
         #       vpcName: Network-Endpoints
         #       account: Network
+        # - destinationCidrBlock: 10.200.0.0/16
+        #     attachment:
+        #       directConnectGatewayName: Network-DXGW
         # - destinationCidrBlock: 1.1.1.1/32
         #     blackhole: true
+        # - destinationPrefixList: accelerator-prefix-list
+        #   attachment:
+        #     vpcName: Network-Endpoints
+        #     account: Network
       - name: Network-Main-Segregated
         routes: []
       - name: Network-Main-Shared
         routes: []
       - name: Network-Main-Standalone
         routes: []
+#####################################
+# DHCP options -- use this object   #
+# to define DHCP options sets to use #
+# for VPCs.                         #
+#####################################
 # dhcpOptions:
 #   - name: accelerator-dhcp-opts
 #     accounts:
@@ -47,16 +70,62 @@ transitGateways:
 #     ntpServers:
 #       - 1.1.1.1
 #       - 2.2.2.2
+
+#####################################
+# Central network services -- use   #
+# this object to define a delegated  #
+# admin account and configure        #
+# advanced networking services      #
+#####################################
 # centralNetworkServices:
 #   delegatedAdminAccount: Network
+#   ipams:
+#     - name: accelerator-ipam
+#       region: *HOME_REGION
+#       description: Accelerator IPAM
+#       operatingRegions:
+#         - *HOME_REGION
+#         - us-west-2
+#       pools:
+#         - name: &BASE_POOL base-pool
+#           description: accelerator-base
+#           provisionedCidrs:
+#             - 10.0.0.0/8
+#             - 172.16.0.0/12
+#             - 192.168.0.0/16
+#         - name: home-region-pool
+#           description: Pool for us-east-1
+#           locale: *HOME_REGION
+#           provisionedCidrs:
+#             - 10.0.0.0/16
+#           sourceIpamPool: *BASE_POOL
+#         - name: home-region-prod-pool
+#           description: Pool for prod environment
+#           allocationResourceTags:
+#             - key: env
+#               value: prod
+#           locale: *HOME_REGION
+#           provisionedCidrs:
+#             - 10.0.0.0/24
+#           shareTargets:
+#             organizationalUnits:
+#               - Infrastructure
+#           sourceIpamPool: home-region-pool
+#         - name: west-region-pool
+#           description: Pool for us-west-2
+#           locale: us-west-2
+#           provisionedCidrs:
+#             - 10.1.0.0/16
+#           sourceIpamPool: *BASE_POOL
+#
 #   networkFirewall:
 #     firewalls:
 #       - name: accelerator-firewall
 #         region: *HOME_REGION
 #         firewallPolicy: accelerator-policy
 #         subnets:
-#           - Network-Inspection-A
-#           - Network-Inspection-B
+#           - Network-Inspection-Firewall-A
+#           - Network-Inspection-Firewall-B
 #         vpc: Network-Inspection
 #         loggingConfiguration:
 #           - destination: s3
@@ -77,6 +146,25 @@ transitGateways:
 #           organizationalUnits:
 #             - Infrastructure
 #     rules:
+#        - name: accelerator-suricata-rule-group
+#        regions:
+#          - *HOME_REGION
+#        capacity: 100
+#        type: STATEFUL
+#        ruleGroup:
+#          rulesSource:
+#            rulesFile: firewall-rules/rules.txt
+#          ruleVariables:
+#            ipSets:
+#              name: HOME_NET
+#              definition:
+#                - 10.0.0.0/16
+#                - 10.1.0.0/16
+#            portSets:
+#              name: HOME_NET
+#              definition:
+#                - '80'
+#                - '443'
 #       - name: accelerator-rule-group
 #         regions:
 #           - *HOME_REGION
@@ -142,6 +230,24 @@ transitGateways:
 #               definition:
 #                 - '80'
 #                 - '443'
+#
+#   gatewayLoadBalancers:
+#     - name: Accelerator-GWLB
+#       subnets:
+#         - Network-Inspection-A
+#         - Network-Inspection-B
+#       vpc: Network-Inspection
+#       deletionProtection: true
+#       endpoints:
+#         - name: Endpoint-A
+#           account: Network
+#           subnet: Network-Inspection-A
+#           vpc: Network-Inspection
+#         - name: Endpoint-B
+#           account: Network
+#           subnet: Network-Inspection-B
+#           vpc: Network-Inspection
+#
 #   route53Resolver:
 #     endpoints:
 #       - name: accelerator-inbound
@@ -202,7 +308,14 @@ transitGateways:
 #         shareTargets:
 #           organizationalUnits:
 #             - Infrastructure
-# prefixList:
+
+#####################################
+# Prefix lists -- use this object to #
+# deploy prefix lists to be used for #
+# security groups, subnet routes,   #
+# and/or TGW static routes          #
+#####################################
+# prefixLists:
 #   - name: accelerator-prefix-list
 #     accounts:
 #       - Network
@@ -213,18 +326,109 @@ transitGateways:
 #     entries:
 #       - 10.1.0.1/32
 
+#####################################
+# Endpoint policies -- use this     #
+# object to define standard policies #
+# for VPC endpoints                 #
+#####################################
 endpointPolicies:
   - name: Default
     document: vpc-endpoint-policies/default.json
   - name: Ec2
     document: vpc-endpoint-policies/ec2.json
 
+#####################################
+# VPC templates -- use this object  #
+# to deploy standard VPCs across    #
+# multiple accounts/OUs             #
+#####################################
+# vpcTemplates:
+#   - name: Accelerator-Template
+#     region: *HOME_REGION
+#     deploymentTargets:
+#       organizationalUnits:
+#         - Infrastructure
+#     ipamAllocations:
+#       - ipamPoolName: home-region-prod-pool
+#         netmaskLength: 25
+#     internetGateway: false
+#     enableDnsHostnames: true
+#     enableDnsSupport: true
+#     instanceTenancy: default
+#     routeTables:
+#       - name: Accelerator-Template-Tgw-A
+#         routes: []
+#       - name: Accelerator-Template-Tgw-B
+#         routes: []
+#       - name: Accelerator-Template-A
+#         routes:
+#           - name: TgwRoute
+#             destination: 0.0.0.0/0
+#             type: transitGateway
+#             target: Network-Main
+#       - name: Accelerator-Template-B
+#         routes:
+#           - name: TgwRoute
+#             destination: 0.0.0.0/0
+#             type: transitGateway
+#             target: Network-Main
+#     subnets:
+#       - name: Accelerator-Template-A
+#         availabilityZone: a
+#         routeTable: Accelerator-Template-A
+#         ipamAllocation:
+#           ipamPoolName: home-region-prod-pool
+#           netmaskLength: 27
+#       - name: Accelerator-Template-B
+#         availabilityZone: b
+#         routeTable: Accelerator-Template-B
+#         ipamAllocation:
+#           ipamPoolName: home-region-prod-pool
+#           netmaskLength: 27
+#       - name: Accelerator-TemplateTgwAttach-A
+#         availabilityZone: a
+#         routeTable: Accelerator-Template-Tgw-A
+#         ipamAllocation:
+#           ipamPoolName: home-region-prod-pool
+#           netmaskLength: 27
+#       - name: Accelerator-TemplateTgwAttach-B
+#         availabilityZone: b
+#         routeTable: Accelerator-Template-Tgw-B
+#         ipamAllocation:
+#           ipamPoolName: home-region-prod-pool
+#           netmaskLength: 27
+#     transitGatewayAttachments:
+#       - name: Accelerator-Template
+#         transitGateway:
+#           name: Network-Main
+#           account: Network
+#         routeTableAssociations:
+#           - Network-Main-Shared
+#         routeTablePropagations:
+#           - Network-Main-Core
+#           - Network-Main-Shared
+#           - Network-Main-Segregated
+#         subnets:
+#           - Accelerator-TemplateTgwAttach-A
+#           - Accelerator-TemplateTgwAttach-B
+#     tags:
+#       - key: env
+#         value: prod
+
+#####################################
+# VPCs-- use this object to deploy  #
+# a VPC in a single account and     #
+# region.                           #
+#####################################
 vpcs:
   - name: Network-Endpoints
     account: Network
     region: *HOME_REGION
     cidrs:
       - 10.1.0.0/22
+    # ipamAllocations:
+    #   - ipamPoolName: home-region-prod-pool
+    #     netmaskLength: 25
     internetGateway: false
     # dhcpOptions: accelerator-dhcp-opts
     enableDnsHostnames: true
@@ -248,17 +452,40 @@ vpcs:
             destination: 0.0.0.0/0
             type: transitGateway
             target: Network-Main
+          - name: S3Gateway
+            type: gatewayEndpoint
+            target: s3
+          - name: DynamoDBGateway
+            type: gatewayEndpoint
+            target: dynamodb
+          # - name: PlRoute
+          #   destinationPrefixList: accelerator-prefix-list
+          #   type: transitGateway
+          #   target: Network-Main
       - name: Network-Endpoints-B
         routes:
           - name: TgwRoute
             destination: 0.0.0.0/0
             type: transitGateway
             target: Network-Main
+          - name: S3Gateway
+            type: gatewayEndpoint
+            target: s3
+          - name: DynamoDBGateway
+            type: gatewayEndpoint
+            target: dynamodb
+          # - name: PlRoute
+          #   destinationPrefixList: accelerator-prefix-list
+          #   type: transitGateway
+          #   target: Network-Main
     subnets:
       - name: Network-Endpoints-A
         availabilityZone: a
         routeTable: Network-Endpoints-A
         ipv4CidrBlock: 10.1.0.0/24
+        # ipamAllocation:
+        #   ipamPoolName: home-region-prod-pool
+        #   netmaskLength: 27
       - name: Network-Endpoints-B
         availabilityZone: b
         routeTable: Network-Endpoints-B
@@ -374,12 +601,24 @@ vpcs:
             destination: 0.0.0.0/0
             type: transitGateway
             target: Network-Main
+          - name: S3Gateway
+            type: gatewayEndpoint
+            target: s3
+          - name: DynamoDBGateway
+            type: gatewayEndpoint
+            target: dynamodb
       - name: Network-Inspection-B
         routes:
           - name: TgwRoute
             destination: 0.0.0.0/0
             type: transitGateway
             target: Network-Main
+          - name: S3Gateway
+            type: gatewayEndpoint
+            target: s3
+          - name: DynamoDBGateway
+            type: gatewayEndpoint
+            target: dynamodb
       # - name: Network-Inspection-Tgw-A
       #   routes:
       #     - name: NfwRoute
@@ -387,6 +626,10 @@ vpcs:
       #       type: networkFirewall
       #       target: accelerator-firewall
       #       targetAvailabilityZone: a
+      #     - name: GwlbRoute
+      #       destination: 0.0.0.0/0
+      #       type: gatewayLoadBalancerEndpoint
+      #       target: Endpoint-A
       # - name: Network-Inspection-Tgw-B
       #   routes:
       #     - name: NfwRoute
@@ -394,6 +637,10 @@ vpcs:
       #       type: networkFirewall
       #       target: accelerator-firewall
       #       targetAvailabilityZone: b
+      #     - name: GwlbRoute
+      #       destination: 0.0.0.0/0
+      #       type: gatewayLoadBalancerEndpoint
+      #       target: Endpoint-B
     subnets:
       - name: Network-Inspection-A
         availabilityZone: a
@@ -411,6 +658,14 @@ vpcs:
         availabilityZone: b
         routeTable: Network-Inspection-Tgw-B
         ipv4CidrBlock: 10.2.3.224/28
+      - name: Network-Inspection-Firewall-A
+        availabilityZone: a
+        routeTable: Network-Inspection-A
+        ipv4CidrBlock: 10.2.3.0/28
+      - name: Network-Inspection-Firewall-B
+        availabilityZone: b
+        routeTable: Network-Inspection-B
+        ipv4CidrBlock: 10.2.3.16/28
     transitGatewayAttachments:
       - name: Network-Inspection
         transitGateway:
@@ -449,12 +704,24 @@ vpcs:
             destination: 0.0.0.0/0
             type: transitGateway
             target: Network-Main
+          - name: S3Gateway
+            type: gatewayEndpoint
+            target: s3
+          - name: DynamoDBGateway
+            type: gatewayEndpoint
+            target: dynamodb
       - name: SharedServices-App-B
         routes:
           - name: TgwRoute
             destination: 0.0.0.0/0
             type: transitGateway
             target: Network-Main
+          - name: S3Gateway
+            type: gatewayEndpoint
+            target: s3
+          - name: DynamoDBGateway
+            type: gatewayEndpoint
+            target: dynamodb
     subnets:
       - name: SharedServices-App-A
         availabilityZone: a
@@ -492,12 +759,20 @@ vpcs:
         - service: s3
         - service: dynamodb
     useCentralEndpoints: true
+
+##############################################################
+# Global configuration for VPC flow logs                     #
+# Where there is no flow log configuration defined with VPC  #
+# this configuration will be used for flow log configuration #
+##############################################################
 vpcFlowLogs:
   trafficType: ALL
   maxAggregationInterval: 600
   destinations:
-    - s3
     - cloud-watch-logs
+  destinationsConfig:
+    cloudWatchLogs:
+      retentionInDays: 30
   defaultFormat: false
   customFields:
     - version
@@ -527,8 +802,78 @@ vpcFlowLogs:
     - pkt-dst-aws-service
     - flow-direction
     - traffic-path
+###########################################
+# Customer Gateways-- use this object to  #
+# deploy customer gateways and S2S VPN    #
+# connections                             #
+###########################################
+# customerGateways:
+#   - name: accelerator-cgw
+#     account: Network
+#     region: *HOME_REGION
+#     ipAddress: 1.1.1.1
+#     asn: 65500
+#     vpnConnections:
+#       - name: TGW-VPNConnection
+#         transitGateway: Network-Main
+#         staticRoutesOnly: false
+#         tunnelSpecifications:
+#           - tunnelInsideCidr: 169.254.50.0/30
+#             preSharedKey: Thisismysecret-Abc123
+#           - tunnelInsideCidr: 169.254.60.0/30
+#             preSharedKey: Thisismysecret-Abc123
+
+#####################################
+# Direct Connect Gateways-- use this #
+# object to deploy DX Gateways,      #
+# virtual interfaces, and            #
+# associations to transit gateways   #
+#####################################
+# directConnectGateways:
+#   - name: Network-DXGW
+#     account: Network
+#     asn: 65000
+#     gatewayName: Network-DXGW
+#     virtualInterfaces:
+#       - name: Accelerator-VIF
+#         connectionId: dxcon-test1234
+#         customerAsn: 65002
+#         interfaceName: Accelerator-VIF
+#         ownerAccount: Network
+#         region: us-east-1
+#         type: transit
+#         vlan: 575
+#         enableSiteLink: true
+#         jumboFrames: true
+#     transitGatewayAssociations:
+#       - name: Network-Main
+#         account: Network
+#         allowedPrefixes:
+#           - 10.0.0.0/8
+#           - 192.168.0.0/16
+#         routeTableAssociations:
+#           - Network-Main-Core
+#         routeTablePropagations:
+#           - Network-Main-Core
+
+#####################################
+# VPC peering-- use this object to  #
+# deploy peering between two VPCs   #
+#####################################
 # vpcPeering:
-#   - name: NetworkEndpointsToInspection
+#   - name: VpcAtoVpcB
 #     vpcs:
-#       - Network-Endpoints
-#       - Network-Inspection
+#       - VPC-A
+#       - VPC-B
+
+#####################################
+# FMS-- use this object to enable   #
+# fms on the specified account      #
+#####################################
+# firewallManagerService:
+#   delegatedAdminAccount: SharedNetwork
+#   notificationChannels:
+#     - snsTopic: Low
+#       region: us-west-2
+#     - snsTopic: Low
+#       region: us-east-2

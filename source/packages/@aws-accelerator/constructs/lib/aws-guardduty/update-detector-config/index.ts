@@ -29,15 +29,18 @@ export async function handler(event: AWSLambda.CloudFormationCustomResourceEvent
   | undefined
 > {
   const region = event.ResourceProperties['region'];
-  const adminAccountId = event.ResourceProperties['adminAccountId'];
-  const isExportConfigEnable = event.ResourceProperties['isExportConfigEnable'] === 'true';
-  const exportDestination = event.ResourceProperties['exportDestination'];
   const exportFrequency = event.ResourceProperties['exportFrequency'];
+  const enableS3Protection = event.ResourceProperties['enableS3Protection'] === 'true';
+  const enableEksProtection = event.ResourceProperties['enableEksProtection'] === 'true';
+  const solutionId = process.env['SOLUTION_ID'];
 
-  const guardDutyClient = new AWS.GuardDuty({ region: region });
+  const guardDutyClient = new AWS.GuardDuty({ region: region, customUserAgent: solutionId });
   const detectorId = await getDetectorId(guardDutyClient);
 
-  const existingMemberAccountIds: string[] = [adminAccountId];
+  const existingMemberAccountIds: string[] = [];
+
+  console.log(`S3 Protection Enable: ${enableS3Protection}`);
+  console.log(`EKS Protection Enable: ${enableEksProtection}`);
 
   let nextToken: string | undefined = undefined;
   do {
@@ -45,8 +48,7 @@ export async function handler(event: AWSLambda.CloudFormationCustomResourceEvent
       guardDutyClient.listMembers({ DetectorId: detectorId, NextToken: nextToken }).promise(),
     );
     for (const member of page.Members ?? []) {
-      console.log(member);
-      existingMemberAccountIds.push(member.AccountId!);
+      existingMemberAccountIds.push(member.AccountId);
     }
     nextToken = page.NextToken;
   } while (nextToken);
@@ -54,55 +56,105 @@ export async function handler(event: AWSLambda.CloudFormationCustomResourceEvent
   switch (event.RequestType) {
     case 'Create':
     case 'Update':
-      console.log('starting - CreateMembersCommand');
-      if (isExportConfigEnable && exportDestination === 's3') {
+      const dataSourcesToUpdate: AWS.GuardDuty.DataSourceConfigurations = {};
+      dataSourcesToUpdate.S3Logs = { Enable: enableS3Protection };
+      dataSourcesToUpdate.Kubernetes = { AuditLogs: { Enable: enableEksProtection } };
+      console.log('starting - UpdateMembersCommand');
+      try {
         await throttlingBackOff(() =>
           guardDutyClient
             .updateMemberDetectors({
               DetectorId: detectorId,
               AccountIds: existingMemberAccountIds,
-              DataSources: { S3Logs: { Enable: isExportConfigEnable } },
+              DataSources: dataSourcesToUpdate,
             })
             .promise(),
         );
-
+        // eslint-disable-next-line @typescript-eslint/no-explicit-any
+      } catch (e: any) {
+        if (
+          e.statusCode == 400 &&
+          e.message.startsWith('The request is rejected because an invalid or out-of-range value')
+        ) {
+          const dataSourcesToUpdate: AWS.GuardDuty.DataSourceConfigurations = {};
+          dataSourcesToUpdate.S3Logs = { Enable: enableS3Protection };
+          await throttlingBackOff(() =>
+            guardDutyClient
+              .updateMemberDetectors({
+                DetectorId: detectorId,
+                AccountIds: existingMemberAccountIds,
+                DataSources: dataSourcesToUpdate,
+              })
+              .promise(),
+          );
+        } else {
+          console.log(`Error: ${JSON.stringify(e)}`);
+          return { Status: 'Failure', StatusCode: e.statuCode };
+        }
+      }
+      console.log('starting - UpdateDetectorCommand');
+      try {
         await throttlingBackOff(() =>
           guardDutyClient
             .updateDetector({
               DetectorId: detectorId,
               Enable: true,
               FindingPublishingFrequency: exportFrequency,
-              DataSources: { S3Logs: { Enable: isExportConfigEnable } },
+              DataSources: dataSourcesToUpdate,
             })
             .promise(),
         );
+        // eslint-disable-next-line @typescript-eslint/no-explicit-any
+      } catch (e: any) {
+        if (
+          e.statusCode == 400 &&
+          e.message.startsWith('The request is rejected because an invalid or out-of-range value')
+        ) {
+          const dataSourcesToUpdate: AWS.GuardDuty.DataSourceConfigurations = {};
+          dataSourcesToUpdate.S3Logs = { Enable: enableS3Protection };
+          await throttlingBackOff(() =>
+            guardDutyClient
+              .updateDetector({
+                DetectorId: detectorId,
+                Enable: true,
+                FindingPublishingFrequency: exportFrequency,
+                DataSources: dataSourcesToUpdate,
+              })
+              .promise(),
+          );
+        } else {
+          console.log(`Error: ${JSON.stringify(e)}`);
+          return { Status: 'Failure', StatusCode: e.statuCode };
+        }
       }
 
       return { Status: 'Success', StatusCode: 200 };
 
     case 'Delete':
-      if (isExportConfigEnable && exportDestination === 's3') {
-        await throttlingBackOff(() =>
-          guardDutyClient
-            .updateDetector({
-              DetectorId: detectorId,
-              Enable: false,
-              FindingPublishingFrequency: exportFrequency,
-              DataSources: { S3Logs: { Enable: false } },
-            })
-            .promise(),
-        );
+      console.log('starting - Delete');
+      const dataSourcesToRemove: AWS.GuardDuty.DataSourceConfigurations = {};
+      dataSourcesToRemove.S3Logs = { Enable: false };
+      dataSourcesToRemove.Kubernetes = { AuditLogs: { Enable: false } };
+      await throttlingBackOff(() =>
+        guardDutyClient
+          .updateDetector({
+            DetectorId: detectorId,
+            Enable: false,
+            FindingPublishingFrequency: exportFrequency,
+            DataSources: dataSourcesToRemove,
+          })
+          .promise(),
+      );
 
-        await throttlingBackOff(() =>
-          guardDutyClient
-            .updateMemberDetectors({
-              DetectorId: detectorId,
-              AccountIds: existingMemberAccountIds,
-              DataSources: { S3Logs: { Enable: false } },
-            })
-            .promise(),
-        );
-      }
+      await throttlingBackOff(() =>
+        guardDutyClient
+          .updateMemberDetectors({
+            DetectorId: detectorId,
+            AccountIds: existingMemberAccountIds,
+            DataSources: dataSourcesToRemove,
+          })
+          .promise(),
+      );
 
       return { Status: 'Success', StatusCode: 200 };
   }

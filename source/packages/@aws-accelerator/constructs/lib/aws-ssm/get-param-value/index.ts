@@ -11,9 +11,10 @@
  *  and limitations under the License.
  */
 
-import { throttlingBackOff } from '@aws-accelerator/utils';
 import * as AWS from 'aws-sdk';
-import * as console from 'console';
+
+import { throttlingBackOff } from '@aws-accelerator/utils';
+
 AWS.config.logger = console;
 
 /**
@@ -29,18 +30,19 @@ export async function handler(event: AWSLambda.CloudFormationCustomResourceEvent
     }
   | undefined
 > {
-  const region = event.ResourceProperties['region'];
+  const parameterRegion = event.ResourceProperties['parameterRegion'];
   const invokingAccountID = event.ResourceProperties['invokingAccountID'];
   const parameterAccountID = event.ResourceProperties['parameterAccountID'];
   const assumeRoleArn = event.ResourceProperties['assumeRoleArn'];
   const parameterName = event.ResourceProperties['parameterName'];
+  const solutionId = process.env['SOLUTION_ID'];
 
   switch (event.RequestType) {
     case 'Create':
     case 'Update':
       let ssmClient: AWS.SSM;
       if (invokingAccountID !== parameterAccountID) {
-        const stsClient = new AWS.STS({ region: region });
+        const stsClient = new AWS.STS({ region: parameterRegion, customUserAgent: solutionId });
         const assumeRoleCredential = await throttlingBackOff(() =>
           stsClient
             .assumeRole({
@@ -49,23 +51,21 @@ export async function handler(event: AWSLambda.CloudFormationCustomResourceEvent
             })
             .promise(),
         );
-        console.log(assumeRoleCredential);
         ssmClient = new AWS.SSM({
-          region: region,
+          region: parameterRegion,
           credentials: {
             accessKeyId: assumeRoleCredential.Credentials!.AccessKeyId,
             secretAccessKey: assumeRoleCredential.Credentials!.SecretAccessKey,
             sessionToken: assumeRoleCredential.Credentials!.SessionToken,
             expireTime: assumeRoleCredential.Credentials!.Expiration,
           },
+          customUserAgent: solutionId,
         });
       } else {
-        ssmClient = new AWS.SSM({ region: region });
+        ssmClient = new AWS.SSM({ region: parameterRegion, customUserAgent: solutionId });
       }
 
       const response = await throttlingBackOff(() => ssmClient.getParameter({ Name: parameterName }).promise());
-
-      console.log(response.Parameter!.Value);
 
       return { PhysicalResourceId: response.Parameter!.Value, Status: 'SUCCESS' };
 
